@@ -18,6 +18,8 @@
 //   timeoutMs            – HTTP request timeout in ms          (default: 5000)
 //   broadcastOnMatchEnd  – tell players stats were submitted   (default: false)
 //   includeClientIp      – include player IP in payload        (default: false)
+//   minPlayers           – minimum players to submit stats     (default: 2)
+//   maxRetries           – retry attempts on failed POST       (default: 1)
 //
 // COMMANDS
 //   !matchstats (!ms)  – [Moderator] show current tracking status
@@ -25,21 +27,26 @@
 //
 // MATCH STATS PAYLOAD  (POST → apiUrl)
 //   {
-//     "serverId":   "<server id>",
-//     "serverName": "<server hostname>",
-//     "mapName":    "<current map>",
-//     "gameType":   "<game type>",
-//     "matchEndUtc":"<ISO timestamp>",
+//     "match_id":         "<uuid>",
+//     "server_id":        "<IP:port>",
+//     "server_name":      "<server hostname>",
+//     "map_name":         "<current map>",
+//     "game":             "<game code, e.g. IW4, T6>",
+//     "game_type":        "<game mode, e.g. sd, dom, war>",
+//     "match_start_utc":  "<ISO timestamp>",
+//     "match_end_utc":    "<ISO timestamp>",
+//     "duration_seconds": 600,
 //     "players": [
 //       {
-//         "clientId":    123,
-//         "networkId":   "110000100000000",
-//         "name":        "PlayerName",
-//         "score":       1500,
-//         "kills":       12,
-//         "deaths":      4,
-//         "team":        "allies",
-//         "ip":          "1.2.3.4"          // only if includeClientIp is true
+//         "client_id":           123,
+//         "network_id":          "110000100000000",
+//         "name":                "PlayerName",
+//         "score":               1500,
+//         "kills":               12,
+//         "deaths":              4,
+//         "killing_blow_damage": 2400,
+//         "team":                "allies",
+//         "ip":                  "1.2.3.4"   // only if includeClientIp is true
 //       },
 //       ...
 //     ]
@@ -47,8 +54,8 @@
 //
 // VERIFY PAYLOAD  (POST → verifyUrl)
 //   {
-//     "networkId":  "110000100000000",
-//     "clientId":   123,
+//     "network_id": "110000100000000",
+//     "client_id":  123,
 //     "name":       "PlayerName",
 //     "code":       "A3X9"
 //   }
@@ -96,12 +103,18 @@ const plugin = {
         apiKey: '',
         timeoutMs: 5000,
         broadcastOnMatchEnd: false,
-        includeClientIp: false
+        includeClientIp: false,
+        minPlayers: 2,
+        maxRetries: 1
     },
 
     // --------------- per-server match trackers ---------------
-    // Keyed by server endpoint string → { kills: {}, deaths: {}, damage: {} }
+    // Keyed by server endpoint string → { matchId, startedAt, kills, deaths, damage, ... }
     matchData: {},
+
+    // --------------- verify cooldown tracker ---------------
+    // Keyed by clientId → timestamp of last !verify attempt
+    verifyCooldowns: {},
 
     // =====================================================================
     //  Lifecycle
@@ -145,13 +158,15 @@ const plugin = {
 
         const serverKey = this.getServerKey(matchStartEvent.server);
         this.matchData[serverKey] = {
-            kills: {},   // clientId → kill count
-            deaths: {},  // clientId → death count
-            damage: {}   // clientId → total damage dealt
+            matchId: this.generateUUID(),
+            startedAt: new Date(),
+            kills: {},
+            deaths: {},
+            damage: {}
         };
 
-        this.logger.logDebug('{Name}: Match started on {Server} — trackers reset',
-            this.name, serverKey);
+        this.logger.logDebug('{Name}: Match started on {Server} (matchId={MatchId}) — trackers reset',
+            this.name, serverKey, this.matchData[serverKey].matchId);
     },
 
     /** Accumulate kill / death / damage tallies during the match. */
@@ -235,7 +250,6 @@ const plugin = {
         const serverKey = this.getServerKey(server);
         this.ensureServerData(serverKey);
 
-        // Build the players array from current server clients + accumulated stats
         const players = [];
         try {
             const connectedClients = server.getClientsAsList();
@@ -247,13 +261,13 @@ const plugin = {
 
                 const cid = client.clientId;
                 const playerEntry = {
-                    clientId: cid,
-                    networkId: client.networkId ? client.networkId.toString() : '',
+                    client_id: cid,
+                    network_id: client.networkId ? client.networkId.toString() : '',
                     name: client.cleanedName || client.name || '',
                     score: (this.matchData[serverKey].scores || {})[cid] || client.score || 0,
                     kills: this.matchData[serverKey].kills[cid] || 0,
                     deaths: this.matchData[serverKey].deaths[cid] || 0,
-                    damage: this.matchData[serverKey].damage[cid] || 0,
+                    killing_blow_damage: this.matchData[serverKey].damage[cid] || 0,
                     team: (this.matchData[serverKey].teams || {})[cid] || ''
                 };
 
@@ -267,14 +281,27 @@ const plugin = {
             this.logger.logWarning('{Name}: Error building player list — {Error}', this.name, e.message);
         }
 
-        // Construct the payload
+        if (players.length < this.config.minPlayers) {
+            this.logger.logDebug('{Name}: Only {Count} player(s) on {Server} — skipping submission (min: {Min})',
+                this.name, players.length, serverKey, this.config.minPlayers);
+            delete this.matchData[serverKey];
+            return;
+        }
+
+        const endTime = new Date();
+        const startTime = this.matchData[serverKey].startedAt || endTime;
+        const durationSeconds = Math.round((endTime.getTime() - startTime.getTime()) / 1000);
+
         const payload = {
-            serverId: server.id ? server.id.toString() : '',
-            serverName: server.serverName || server.hostname || '',
-            mapName: server.currentMap ? (server.currentMap.name || '') : '',
-            gameType: server.gameType ? server.gameType.toString() : '',
-            matchEndUtc: new Date().toISOString(),
-            playerCount: players.length,
+            match_id: this.matchData[serverKey].matchId || this.generateUUID(),
+            server_id: server.toString(),
+            server_name: server.serverName || server.hostname || '',
+            map_name: server.currentMap ? (server.currentMap.name || '') : '',
+            game: server.gameName ? server.gameName.toString() : '',
+            game_type: server.gameType ? server.gameType.toString() : '',
+            match_start_utc: startTime.toISOString(),
+            match_end_utc: endTime.toISOString(),
+            duration_seconds: durationSeconds,
             players: players
         };
 
@@ -283,10 +310,8 @@ const plugin = {
             this.name, serverKey, players.length
         );
 
-        // Send it
-        this.postMatchStats(payload);
+        this.postMatchStats(payload, serverKey);
 
-        // Optional in-game broadcast
         if (this.config.broadcastOnMatchEnd && players.length > 0) {
             try {
                 server.broadcast('Match stats have been recorded!');
@@ -295,9 +320,6 @@ const plugin = {
                     this.name, e.message);
             }
         }
-
-        // Clear accumulated data for this server
-        delete this.matchData[serverKey];
     },
 
     // =====================================================================
@@ -306,19 +328,21 @@ const plugin = {
 
     /**
      * POST the match payload to the configured API endpoint.
-     * Uses IW4MAdmin's ScriptPluginWebRequest + pluginHelper.requestUrl()
-     * for async HTTP (the same mechanism used by VPNDetection.js).
+     * Cleans up matchData only after a successful response.
+     * Retries up to config.maxRetries times on failure.
      */
-    postMatchStats: function (payload) {
+    postMatchStats: function (payload, serverKey, attempt) {
+        attempt = attempt || 1;
+
         if (!this.config.apiUrl || this.config.apiUrl === 'https://your-api.example.com/api/matchstats') {
             this.logger.logWarning('{Name}: API URL is not configured — skipping POST', this.name);
+            delete this.matchData[serverKey];
             return;
         }
 
         try {
             const bodyJson = JSON.stringify(payload);
 
-            // Build headers dictionary
             const stringDict = System.Collections.Generic.Dictionary(System.String, System.String);
             const headers = new stringDict();
             headers.add('Content-Type', 'application/json');
@@ -327,7 +351,6 @@ const plugin = {
                 headers.add('Authorization', 'Bearer ' + this.config.apiKey);
             }
 
-            // Create the web request via IW4MAdmin's built-in helper
             const pluginScript = importNamespace('IW4MAdmin.Application.Plugin.Script');
             const request = new pluginScript.ScriptPluginWebRequest(
                 this.config.apiUrl,
@@ -337,35 +360,65 @@ const plugin = {
                 headers
             );
 
-            // Fire the async request with a callback
+            const currentAttempt = attempt;
+            const maxRetries = this.config.maxRetries || 1;
+            const capturedPayload = payload;
+            const capturedServerKey = serverKey;
+
             this.pluginHelper.requestUrl(request, (response) => {
-                plugin.onApiResponse(response);
+                plugin.onApiResponse(response, capturedServerKey, capturedPayload, currentAttempt, maxRetries);
             });
 
-            this.logger.logDebug('{Name}: POST dispatched to {Url} ({Bytes} bytes)',
-                this.name, this.config.apiUrl, bodyJson.length);
+            this.logger.logDebug('{Name}: POST dispatched to {Url} ({Bytes} bytes, attempt {Attempt})',
+                this.name, this.config.apiUrl, bodyJson.length, attempt);
 
         } catch (ex) {
             this.logger.logError('{Name}: Failed to POST match stats — {Error}',
                 this.name, ex.message);
+            delete this.matchData[serverKey];
         }
     },
 
-    /** Handle the API response / log success or failure. */
-    onApiResponse: function (response) {
+    /** Handle the API response: check for success, retry on failure, clean up on success. */
+    onApiResponse: function (response, serverKey, payload, attempt, maxRetries) {
         if (!response) {
-            this.logger.logWarning('{Name}: Empty response from API', this.name);
+            this.logger.logWarning('{Name}: Empty response from API (attempt {Attempt})',
+                this.name, attempt);
+            this.handleRetry(serverKey, payload, attempt, maxRetries);
             return;
         }
 
         try {
             const parsed = JSON.parse(response);
-            this.logger.logInformation('{Name}: API responded — {Response}',
+
+            if (parsed.errors || parsed.success === false) {
+                this.logger.logWarning('{Name}: API rejected the payload (attempt {Attempt}) — {Response}',
+                    this.name, attempt, response.substring(0, 200));
+                this.handleRetry(serverKey, payload, attempt, maxRetries);
+                return;
+            }
+
+            this.logger.logInformation('{Name}: API accepted match data — {Response}',
                 this.name, response.substring(0, 200));
+            delete this.matchData[serverKey];
+
         } catch (_) {
-            // Response wasn't JSON — just log the first 200 chars
-            this.logger.logInformation('{Name}: API response (non-JSON): {Response}',
-                this.name, (response || '').substring(0, 200));
+            this.logger.logWarning('{Name}: Non-JSON API response (attempt {Attempt}): {Response}',
+                this.name, attempt, (response || '').substring(0, 200));
+            this.handleRetry(serverKey, payload, attempt, maxRetries);
+        }
+    },
+
+    /** Retry a failed POST or give up and discard the data. */
+    handleRetry: function (serverKey, payload, attempt, maxRetries) {
+        if (attempt < maxRetries + 1) {
+            this.logger.logInformation('{Name}: Retrying POST (attempt {Next} of {Max})...',
+                this.name, attempt + 1, maxRetries + 1);
+            this.postMatchStats(payload, serverKey, attempt + 1);
+        } else {
+            this.logger.logError('{Name}: All {Max} attempt(s) failed — match data for {Server} has been lost',
+                this.name, maxRetries + 1, serverKey);
+            delete this.matchData[serverKey];
         }
     },
 
@@ -390,8 +443,8 @@ const plugin = {
 
         try {
             const payload = {
-                networkId: client.networkId ? client.networkId.toString() : '',
-                clientId: client.clientId,
+                network_id: client.networkId ? client.networkId.toString() : '',
+                client_id: client.clientId,
                 name: client.cleanedName || client.name || '',
                 code: code
             };
@@ -426,7 +479,7 @@ const plugin = {
 
             this.logger.logInformation(
                 '{Name}: Verification request sent for {Player} (networkId={Nid})',
-                this.name, client.cleanedName || client.name, payload.networkId
+                this.name, client.cleanedName || client.name, payload.network_id
             );
 
             client.tell('Verifying your code, please wait...');
@@ -474,16 +527,22 @@ const plugin = {
     //  Helpers
     // =====================================================================
 
-    /** Derive a stable key for a server instance. */
+    /** Derive a stable key using IP:Port so it survives database rebuilds. */
     getServerKey: function (server) {
         if (!server) return 'unknown';
-        return (server.id || server.listenAddress || 'unknown').toString();
+        try {
+            var key = server.toString();
+            if (key && key !== '') return key;
+        } catch (_) {}
+        return (server.listenAddress || server.id || 'unknown').toString();
     },
 
     /** Lazily initialise the tracker object for a server. */
     ensureServerData: function (serverKey) {
         if (!this.matchData[serverKey]) {
             this.matchData[serverKey] = {
+                matchId: this.generateUUID(),
+                startedAt: new Date(),
                 kills: {},
                 deaths: {},
                 damage: {},
@@ -491,6 +550,14 @@ const plugin = {
                 teams: {}
             };
         }
+    },
+
+    /** Generate a v4 UUID (Jint doesn't provide crypto.randomUUID). */
+    generateUUID: function () {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            var r = Math.random() * 16 | 0;
+            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+        });
     }
 };
 
@@ -515,35 +582,44 @@ const commands = [
             );
         }
     },
-    {
-        name: 'verify',
-        description: 'links your game account to your web profile using a verification code',
-        alias: 'vfy',
-        permission: 'User',
-        targetRequired: false,
-        arguments: [{
-            name: 'code',
-            required: true
-        }],
-        execute: (gameEvent) => {
-            if (!plugin.config.enabled) {
-                gameEvent.origin.tell('Match Stats API plugin is currently disabled.');
-                return;
-            }
-
-            const code = (gameEvent.data || '').trim();
-            if (!code) {
-                gameEvent.origin.tell('Usage: !verify <code>  — enter the code shown on the website.');
-                return;
-            }
-
-            // Basic format sanity check — codes should be short alphanumeric strings
-            if (code.length > 16 || !/^[a-zA-Z0-9]+$/.test(code)) {
-                gameEvent.origin.tell('Invalid code format. Codes are short alphanumeric strings.');
-                return;
-            }
-
-            plugin.postVerification(gameEvent.origin, code);
+{
+    name: 'verify',
+    description: 'links your game account to your web profile using a verification code',
+    alias: 'vfy',
+    permission: 'User',
+    targetRequired: false,
+    arguments: [{
+        name: 'code',
+        required: true
+    }],
+    execute: (gameEvent) => {
+        if (!plugin.config.enabled) {
+            gameEvent.origin.tell('Match Stats API plugin is currently disabled.');
+            return;
         }
+
+        var clientId = gameEvent.origin.clientId;
+        var now = Date.now();
+        var lastAttempt = plugin.verifyCooldowns[clientId] || 0;
+        if (now - lastAttempt < 10000) {
+            var remaining = Math.ceil((10000 - (now - lastAttempt)) / 1000);
+            gameEvent.origin.tell('Please wait ' + remaining + ' second(s) before trying again.');
+            return;
+        }
+
+        const code = (gameEvent.data || '').trim();
+        if (!code) {
+            gameEvent.origin.tell('Usage: !verify <code>  — enter the code shown on the website.');
+            return;
+        }
+
+        if (code.length > 16 || !/^[a-zA-Z0-9]+$/.test(code)) {
+            gameEvent.origin.tell('Invalid code format. Codes are short alphanumeric strings.');
+            return;
+        }
+
+        plugin.verifyCooldowns[clientId] = now;
+        plugin.postVerification(gameEvent.origin, code);
     }
+}
 ];
