@@ -10,17 +10,13 @@
 //   3. Edit the JSON config file written on first load (see below).
 //
 // CONFIGURATION (stored automatically on first load)
-//   enabled              – master on/off switch                (default: true)
-//   apiUrl               – the URL to POST match data to      (default: placeholder)
 //   apiKey               – bearer / API key sent in headers    (default: empty)
-//   timeoutMs            – HTTP request timeout in ms          (default: 5000)
-//   broadcastOnMatchEnd  – tell players stats were submitted   (default: false)
 //   includeClientIp      – include player IP in payload        (default: false)
-//   minPlayers           – minimum players to submit stats     (default: 2)
 //   maxRetries           – retry attempts on failed POST       (default: 1)
 //
 // COMMANDS
-//   !matchstats (!ms)  – [Moderator] show current tracking status
+//   !matchstats (!ms)  – [User] show current plugin status
+//   !msdebug           – [User] toggle debug logging on/off
 //
 // MATCH STATS PAYLOAD  (POST → apiUrl)
 //   {
@@ -72,10 +68,12 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
     return plugin;
 };
 
+const FIXED_API_URL = 'https://api.360-arena.com/match_stats';
+
 const plugin = {
     author: 'b_five',
-    version: '1.0',
-    name: 'b_five stats API',
+    version: '1.1',
+    name: 'Match Stats API',
     logger: null,
     manager: null,
     configWrapper: null,
@@ -83,14 +81,19 @@ const plugin = {
 
     // --------------- configuration defaults ---------------
     config: {
-        enabled: true,
-        apiUrl: 'https://your-api.example.com/api/matchstats',
         apiKey: '',
-        timeoutMs: 5000,
-        broadcastOnMatchEnd: false,
         includeClientIp: false,
-        minPlayers: 2,
         maxRetries: 1
+    },
+
+    debugEnabled: false,
+    debugState: {
+        lastDispatchAt: null,
+        lastStatus: 'none',
+        lastError: '',
+        lastResponse: '',
+        totalPosts: 0,
+        totalFailures: 0
     },
 
     // --------------- per-server match trackers ---------------
@@ -111,22 +114,26 @@ const plugin = {
         this.configWrapper.setName(this.name);
         const stored = this.configWrapper.getValue('config', newCfg => {
             if (newCfg) {
-                plugin.logger.logInformation('{Name} config reloaded. Enabled={Enabled}, URL={Url}',
-                    plugin.name, newCfg.enabled, newCfg.apiUrl);
-                plugin.config = newCfg;
+                plugin.config = plugin.sanitizeConfig(newCfg);
+                plugin.logger.logInformation('{Name} config reloaded. URL={Url}',
+                    plugin.name, FIXED_API_URL);
             }
         });
 
         if (stored != null) {
-            this.config = stored;
+            this.config = this.sanitizeConfig(stored);
         } else {
             this.configWrapper.setValue('config', this.config);
         }
 
         this.logger.logInformation(
-            '{Name} {Version} by {Author} loaded. Enabled={Enabled}, API={Url}',
-            this.name, this.version, this.author, this.config.enabled, this.config.apiUrl
+            '{Name} {Version} by {Author} loaded. API={Url}',
+            this.name, this.version, this.author, FIXED_API_URL
         );
+
+        if (!this.config.apiKey) {
+            this.logger.logWarning('{Name}: apiKey is empty. The API will likely reject requests with 401.', this.name);
+        }
     },
 
     // =====================================================================
@@ -135,8 +142,6 @@ const plugin = {
 
     /** Reset per-match data when a new match begins. */
     onMatchStarted: function (matchStartEvent, _token) {
-        if (!this.config.enabled) return;
-
         const serverKey = this.getServerKey(matchStartEvent.server);
         this.matchData[serverKey] = {
             matchId: this.generateUUID(),
@@ -152,8 +157,6 @@ const plugin = {
 
     /** Accumulate kill / death / damage tallies during the match. */
     onClientKilled: function (killEvent, _token) {
-        if (!this.config.enabled) return;
-
         const serverKey = this.getServerKey(killEvent.server);
         this.ensureServerData(serverKey);
 
@@ -181,8 +184,6 @@ const plugin = {
 
     /** Capture latest score from periodic client data updates. */
     onClientDataUpdated: function (updateEvent, _token) {
-        if (!this.config.enabled) return;
-
         const serverKey = this.getServerKey(updateEvent.server);
         this.ensureServerData(serverKey);
 
@@ -202,7 +203,7 @@ const plugin = {
                 const iter = clientsEnum.getEnumerator();
                 while (iter.moveNext()) {
                     const client = iter.current;
-                    if (client && !client.isBot) {
+                    if (client) {
                         this.matchData[serverKey].scores[client.clientId] = client.score || 0;
                         this.matchData[serverKey].teams[client.clientId] = client.teamName || '';
                     }
@@ -220,8 +221,6 @@ const plugin = {
      * Gathers all accumulated data + live client info and POSTs to the API.
      */
     onMatchEnded: function (matchEndEvent, _token) {
-        if (!this.config.enabled) return;
-
         const server = matchEndEvent.server;
         if (!server) {
             this.logger.logWarning('{Name}: MatchEnded event had no server reference', this.name);
@@ -238,7 +237,7 @@ const plugin = {
 
             while (iter.moveNext()) {
                 const client = iter.current;
-                if (!client || client.isBot) continue;
+                if (!client) continue;
 
                 const cid = client.clientId;
                 const playerEntry = {
@@ -260,13 +259,6 @@ const plugin = {
             }
         } catch (e) {
             this.logger.logWarning('{Name}: Error building player list — {Error}', this.name, e.message);
-        }
-
-        if (players.length < this.config.minPlayers) {
-            this.logger.logDebug('{Name}: Only {Count} player(s) on {Server} — skipping submission (min: {Min})',
-                this.name, players.length, serverKey, this.config.minPlayers);
-            delete this.matchData[serverKey];
-            return;
         }
 
         const endTime = new Date();
@@ -292,15 +284,6 @@ const plugin = {
         );
 
         this.postMatchStats(payload, serverKey);
-
-        if (this.config.broadcastOnMatchEnd && players.length > 0) {
-            try {
-                server.broadcast('Match stats have been recorded!');
-            } catch (e) {
-                this.logger.logDebug('{Name}: Could not broadcast end-of-match message: {Error}',
-                    this.name, e.message);
-            }
-        }
     },
 
     // =====================================================================
@@ -315,12 +298,6 @@ const plugin = {
     postMatchStats: function (payload, serverKey, attempt) {
         attempt = attempt || 1;
 
-        if (!this.config.apiUrl || this.config.apiUrl === 'https://your-api.example.com/api/matchstats') {
-            this.logger.logWarning('{Name}: API URL is not configured — skipping POST', this.name);
-            delete this.matchData[serverKey];
-            return;
-        }
-
         try {
             const bodyJson = JSON.stringify(payload);
 
@@ -334,7 +311,7 @@ const plugin = {
 
             const pluginScript = importNamespace('IW4MAdmin.Application.Plugin.Script');
             const request = new pluginScript.ScriptPluginWebRequest(
-                this.config.apiUrl,
+                FIXED_API_URL,
                 bodyJson,
                 'POST',
                 'application/json',
@@ -350,10 +327,16 @@ const plugin = {
                 plugin.onApiResponse(response, capturedServerKey, capturedPayload, currentAttempt, maxRetries);
             });
 
-            this.logger.logDebug('{Name}: POST dispatched to {Url} ({Bytes} bytes, attempt {Attempt})',
-                this.name, this.config.apiUrl, bodyJson.length, attempt);
+            this.debugState.lastDispatchAt = new Date().toISOString();
+            this.debugState.lastStatus = 'dispatched';
+            this.debugState.totalPosts += 1;
+            this.logDebug('{Name}: POST dispatched to {Url} ({Bytes} bytes, attempt {Attempt})',
+                this.name, FIXED_API_URL, bodyJson.length, attempt);
 
         } catch (ex) {
+            this.debugState.lastStatus = 'exception';
+            this.debugState.lastError = ex.message || 'unknown error';
+            this.debugState.totalFailures += 1;
             this.logger.logError('{Name}: Failed to POST match stats — {Error}',
                 this.name, ex.message);
             delete this.matchData[serverKey];
@@ -363,6 +346,9 @@ const plugin = {
     /** Handle the API response: check for success, retry on failure, clean up on success. */
     onApiResponse: function (response, serverKey, payload, attempt, maxRetries) {
         if (!response) {
+            this.debugState.lastStatus = 'empty_response';
+            this.debugState.lastError = 'empty API response';
+            this.debugState.totalFailures += 1;
             this.logger.logWarning('{Name}: Empty response from API (attempt {Attempt})',
                 this.name, attempt);
             this.handleRetry(serverKey, payload, attempt, maxRetries);
@@ -373,21 +359,47 @@ const plugin = {
             const parsed = JSON.parse(response);
 
             if (parsed.errors || parsed.success === false) {
+                this.debugState.lastStatus = 'rejected';
+                this.debugState.lastResponse = response.substring(0, 200);
+                this.debugState.lastError = 'API rejected payload';
+                this.debugState.totalFailures += 1;
                 this.logger.logWarning('{Name}: API rejected the payload (attempt {Attempt}) — {Response}',
                     this.name, attempt, response.substring(0, 200));
                 this.handleRetry(serverKey, payload, attempt, maxRetries);
                 return;
             }
 
+            this.debugState.lastStatus = 'accepted';
+            this.debugState.lastResponse = response.substring(0, 200);
+            this.debugState.lastError = '';
             this.logger.logInformation('{Name}: API accepted match data — {Response}',
                 this.name, response.substring(0, 200));
             delete this.matchData[serverKey];
 
         } catch (_) {
+            this.debugState.lastStatus = 'non_json';
+            this.debugState.lastResponse = (response || '').substring(0, 200);
+            this.debugState.lastError = 'non-JSON API response';
+            this.debugState.totalFailures += 1;
             this.logger.logWarning('{Name}: Non-JSON API response (attempt {Attempt}): {Response}',
                 this.name, attempt, (response || '').substring(0, 200));
             this.handleRetry(serverKey, payload, attempt, maxRetries);
         }
+    },
+
+    sanitizeConfig: function (cfg) {
+        const source = cfg || {};
+        const parsedRetries = parseInt(source.maxRetries, 10);
+        return {
+            apiKey: source.apiKey || '',
+            includeClientIp: source.includeClientIp === true,
+            maxRetries: Number.isFinite(parsedRetries) && parsedRetries >= 0 ? parsedRetries : 1
+        };
+    },
+
+    logDebug: function () {
+        if (!this.debugEnabled || !this.logger) return;
+        this.logger.logInformation.apply(this.logger, arguments);
     },
 
     /** Retry a failed POST or give up and discard the data. */
@@ -447,7 +459,7 @@ const commands = [
         name: 'matchstats',
         description: 'shows current match stat tracking status',
         alias: 'ms',
-        permission: 'Moderator',
+        permission: 'User',
         targetRequired: false,
         arguments: [],
         execute: (gameEvent) => {
@@ -456,10 +468,36 @@ const commands = [
             const tracked = data ? Object.keys(data.kills || {}).length : 0;
 
             gameEvent.origin.tell(
-                'Match Stats API: ' + (plugin.config.enabled ? 'ENABLED' : 'DISABLED') +
+                'Match Stats API: ENABLED' +
                 ' | Tracking ' + tracked + ' player(s) this match' +
-                ' | API: ' + plugin.config.apiUrl
+                ' | API: ' + FIXED_API_URL +
+                ' | Last: ' + plugin.debugState.lastStatus
             );
+        }
+    },
+    {
+        name: 'msdebug',
+        description: 'toggles debug logging and shows last API status',
+        alias: 'msd',
+        permission: 'User',
+        targetRequired: false,
+        arguments: [],
+        execute: (gameEvent) => {
+            const arg = (gameEvent.data || '').trim().toLowerCase();
+            if (arg === 'on') plugin.debugEnabled = true;
+            else if (arg === 'off') plugin.debugEnabled = false;
+            else plugin.debugEnabled = !plugin.debugEnabled;
+
+            gameEvent.origin.tell(
+                'MS Debug ' + (plugin.debugEnabled ? 'ON' : 'OFF') +
+                ' | last=' + plugin.debugState.lastStatus +
+                ' | posts=' + plugin.debugState.totalPosts +
+                ' | failures=' + plugin.debugState.totalFailures
+            );
+
+            if (plugin.debugState.lastError) {
+                gameEvent.origin.tell('MS Debug error: ' + plugin.debugState.lastError);
+            }
         }
     }
 ];

@@ -20,16 +20,15 @@ All script plugin settings share this file. This plugin's settings are stored un
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | boolean | `true` | Master on/off switch for the entire plugin. |
-| `apiUrl` | string | `https://your-api.example.com/api/matchstats` | URL that receives the match-stats POST when a match ends. |
 | `apiKey` | string | *(empty)* | Bearer token sent in the `Authorization` header of every request. |
-| `timeoutMs` | number | `5000` | HTTP request timeout in milliseconds. |
-| `broadcastOnMatchEnd` | boolean | `false` | If `true`, sends an in-game message to all players when stats are submitted. |
 | `includeClientIp` | boolean | `false` | If `true`, each player object in the payload includes their IP address. |
-| `minPlayers` | number | `2` | Minimum non-bot players required to submit stats. Matches below this threshold are silently skipped. |
 | `maxRetries` | number | `1` | Number of retry attempts when a POST fails. The plugin makes up to `1 + maxRetries` total attempts before discarding the data. |
 
-**Important:** The plugin will not send any data until you replace the placeholder `apiUrl` with a real endpoint. A warning is logged each match if the URL is still set to the default placeholder.
+The endpoint is fixed in the plugin to:
+
+`https://api.360-arena.com/match_stats`
+
+In normal use, you only need to set `apiKey`.
 
 ## When Does the Sync Run?
 
@@ -37,9 +36,7 @@ Stats are collected continuously during a match and sent **once at match end**:
 
 1. **Match start** — all per-server tracking counters (kills, deaths, damage) are reset. A unique match ID (UUID) and start timestamp are generated.
 2. **During the match** — every kill event increments the attacker's kill count and the victim's death count, and accumulates killing-blow damage. Periodic client-data updates capture each player's score and team.
-3. **Match end** (`ShutdownGame` in the game log) — the plugin assembles the full payload from the accumulated data plus the current client list and POSTs it to `apiUrl`. Match data is only cleared after the API confirms receipt; on failure the plugin retries up to `maxRetries` times.
-
-If fewer than `minPlayers` non-bot players are connected at match end, submission is skipped entirely to avoid noise from empty servers.
+3. **Match end** (`ShutdownGame` in the game log) — the plugin assembles the full payload from the accumulated data plus the current client list and POSTs it to the fixed ingest URL. Match data is only cleared after the API confirms receipt; on failure the plugin retries up to `maxRetries` times.
 
 No data is sent mid-match; there is exactly **one POST per completed match per server**.
 
@@ -47,15 +44,16 @@ No data is sent mid-match; there is exactly **one POST per completed match per s
 
 | Command | Alias | Permission | Description |
 |---|---|---|---|
-| `!matchstats` | `!ms` | Moderator | Shows whether the plugin is enabled, how many players are being tracked in the current match, and the configured API URL. |
+| `!matchstats` | `!ms` | User | Shows current tracking status, API URL, and last submit status. |
+| `!msdebug [on/off]` | `!msd` | User | Toggles verbose debug mode and prints last dispatch/error counters. |
 
 ## API Payloads
 
 All payload keys use **snake_case** to align with typical Rails/API conventions.
 
-### Match Stats (`POST → apiUrl`)
+### Match Stats (`POST → https://api.360-arena.com/match_stats`)
 
-Sent automatically at the end of every match (when `minPlayers` threshold is met).
+Sent automatically at the end of every match.
 
 ```json
 {
@@ -92,7 +90,7 @@ Sent automatically at the end of every match (when `minPlayers` threshold is met
 
 > **`killing_blow_damage`** is the sum of final-hit damage from kills, not total damage dealt during the match. IW4MAdmin only exposes per-kill damage (the damage of the shot that secured the kill), so a player who deals significant chip damage but gets no kills will show `0`. Keep this in mind when interpreting the data.
 
-> The `ip` field is only included when `includeClientIp` is `true`.
+> The payload includes bots and human players. The `ip` field is only included when `includeClientIp` is `true`.
 
 **Headers sent with every request:**
 
@@ -103,14 +101,13 @@ Sent automatically at the end of every match (when `minPlayers` threshold is met
 
 Your receiving API needs to handle one route:
 
-1. **`POST /api/matchstats`** — accept the match payload, validate the bearer token, and store the data. Use `match_id` as a unique key to safely handle duplicate submissions. Return a JSON body; the plugin checks for `success` and `errors` fields to determine whether to retry.
+1. **`POST /match_stats`** — accept the match payload, validate the bearer token, and store the data. Use `match_id` as a unique key to safely handle duplicate submissions. Return a JSON body; the plugin checks for `success` and `errors` fields to determine whether to retry.
 
 The endpoint should return a JSON body. Non-JSON responses trigger a retry.
 
 ## Troubleshooting
 
-- **"API URL is not configured"** in the log — you haven't changed `apiUrl` from its placeholder default.
-- **No data sent** — make sure `enabled` is `true` and that at least `minPlayers` non-bot players are connected when the match ends.
+- **No data sent** — run `!ms` and `!msdebug on` and watch IW4MAdmin logs for `Match Stats API` lines.
 - **Timeout errors** — increase `timeoutMs` or check network connectivity between the IW4MAdmin host and your API.
 - **"All attempts failed"** — the POST failed on every attempt (initial + retries). Check your API availability, then consider increasing `maxRetries`.
 - **Stale match data after a server crash** — if a game server crashes mid-match without emitting `ShutdownGame`, the in-memory match data for that server lingers until the next match starts on the same server, at which point it is overwritten. This is not a memory leak in practice, but means the crashed match's stats are lost.
