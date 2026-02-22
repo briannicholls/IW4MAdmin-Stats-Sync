@@ -2,18 +2,16 @@
 // MatchStatsAPI.js — IW4MAdmin JavaScript Plugin
 // =============================================================================
 // Collects per-match player stats (kills, deaths, damage, etc.) and POSTs
-// them to an external API endpoint when each match ends.  Also provides a
-// !verify command for account-ownership verification (2FA-style linking).
+// them to an external API endpoint when each match ends.
 //
 // INSTALLATION
 //   1. Copy this file into your IW4MAdmin "Plugins" folder.
 //   2. Start/restart IW4MAdmin — the plugin loads automatically.
-//   3. Configure via the IW4MAdmin web or JSON config (see below).
+//   3. Edit the JSON config file written on first load (see below).
 //
 // CONFIGURATION (stored automatically on first load)
 //   enabled              – master on/off switch                (default: true)
 //   apiUrl               – the URL to POST match data to      (default: placeholder)
-//   verifyUrl            – the URL to POST verify requests to  (default: placeholder)
 //   apiKey               – bearer / API key sent in headers    (default: empty)
 //   timeoutMs            – HTTP request timeout in ms          (default: 5000)
 //   broadcastOnMatchEnd  – tell players stats were submitted   (default: false)
@@ -23,7 +21,6 @@
 //
 // COMMANDS
 //   !matchstats (!ms)  – [Moderator] show current tracking status
-//   !verify <code> (!vfy) – [User] link game account to web profile
 //
 // MATCH STATS PAYLOAD  (POST → apiUrl)
 //   {
@@ -52,17 +49,6 @@
 //     ]
 //   }
 //
-// VERIFY PAYLOAD  (POST → verifyUrl)
-//   {
-//     "network_id": "110000100000000",
-//     "client_id":  123,
-//     "name":       "PlayerName",
-//     "code":       "A3X9"
-//   }
-//
-// EXPECTED VERIFY RESPONSE
-//   { "success": true,  "message": "Account verified successfully!" }
-//   { "success": false, "message": "Invalid or expired code." }
 // =============================================================================
 
 const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
@@ -89,7 +75,7 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
 const plugin = {
     author: 'b_five',
     version: '1.0',
-    name: 'Match Stats API',
+    name: 'b_five stats API',
     logger: null,
     manager: null,
     configWrapper: null,
@@ -99,7 +85,6 @@ const plugin = {
     config: {
         enabled: true,
         apiUrl: 'https://your-api.example.com/api/matchstats',
-        verifyUrl: 'https://your-api.example.com/api/verify',
         apiKey: '',
         timeoutMs: 5000,
         broadcastOnMatchEnd: false,
@@ -111,10 +96,6 @@ const plugin = {
     // --------------- per-server match trackers ---------------
     // Keyed by server endpoint string → { matchId, startedAt, kills, deaths, damage, ... }
     matchData: {},
-
-    // --------------- verify cooldown tracker ---------------
-    // Keyed by clientId → timestamp of last !verify attempt
-    verifyCooldowns: {},
 
     // =====================================================================
     //  Lifecycle
@@ -423,107 +404,6 @@ const plugin = {
     },
 
     // =====================================================================
-    //  Account Verification
-    // =====================================================================
-
-    /**
-     * POST a verification code + player identity to the configured verify endpoint.
-     * Called when a player runs !verify <code> in-game.
-     *
-     * @param {object} client  – the EFClient who ran the command
-     * @param {string} code    – the short-lived code from the web app
-     */
-    postVerification: function (client, code) {
-        if (!this.config.verifyUrl ||
-            this.config.verifyUrl === 'https://your-api.example.com/api/verify') {
-            this.logger.logWarning('{Name}: Verify URL is not configured — skipping', this.name);
-            client.tell('Verification is not configured on this server.');
-            return;
-        }
-
-        try {
-            const payload = {
-                network_id: client.networkId ? client.networkId.toString() : '',
-                client_id: client.clientId,
-                name: client.cleanedName || client.name || '',
-                code: code
-            };
-
-            const bodyJson = JSON.stringify(payload);
-
-            // Build headers dictionary
-            const stringDict = System.Collections.Generic.Dictionary(System.String, System.String);
-            const headers = new stringDict();
-            headers.add('Content-Type', 'application/json');
-
-            if (this.config.apiKey) {
-                headers.add('Authorization', 'Bearer ' + this.config.apiKey);
-            }
-
-            // Create the web request
-            const pluginScript = importNamespace('IW4MAdmin.Application.Plugin.Script');
-            const request = new pluginScript.ScriptPluginWebRequest(
-                this.config.verifyUrl,
-                bodyJson,
-                'POST',
-                'application/json',
-                headers
-            );
-
-            // Capture a reference to tell the player the result
-            const playerRef = client;
-
-            this.pluginHelper.requestUrl(request, (response) => {
-                plugin.onVerifyResponse(response, playerRef);
-            });
-
-            this.logger.logInformation(
-                '{Name}: Verification request sent for {Player} (networkId={Nid})',
-                this.name, client.cleanedName || client.name, payload.network_id
-            );
-
-            client.tell('Verifying your code, please wait...');
-
-        } catch (ex) {
-            this.logger.logError('{Name}: Failed to POST verification — {Error}',
-                this.name, ex.message);
-            client.tell('An error occurred while verifying. Please try again.');
-        }
-    },
-
-    /**
-     * Handle the verification API response and relay the result to the player.
-     *
-     * Expects JSON: { "success": true/false, "message": "..." }
-     */
-    onVerifyResponse: function (response, client) {
-        if (!response) {
-            this.logger.logWarning('{Name}: Empty response from verify API', this.name);
-            if (client) client.tell('Verification failed — no response from server.');
-            return;
-        }
-
-        try {
-            const parsed = JSON.parse(response);
-
-            if (parsed.success) {
-                this.logger.logInformation('{Name}: Verification succeeded for {Player}',
-                    this.name, client ? (client.cleanedName || client.name) : 'unknown');
-                if (client) client.tell(parsed.message || 'Account verified successfully!');
-            } else {
-                this.logger.logInformation('{Name}: Verification failed for {Player} — {Msg}',
-                    this.name, client ? (client.cleanedName || client.name) : 'unknown',
-                    parsed.message || 'unknown reason');
-                if (client) client.tell(parsed.message || 'Verification failed. Check your code and try again.');
-            }
-        } catch (_) {
-            this.logger.logWarning('{Name}: Unexpected verify response: {Response}',
-                this.name, (response || '').substring(0, 200));
-            if (client) client.tell('Verification failed — unexpected response from server.');
-        }
-    },
-
-    // =====================================================================
     //  Helpers
     // =====================================================================
 
@@ -533,7 +413,7 @@ const plugin = {
         try {
             var key = server.toString();
             if (key && key !== '') return key;
-        } catch (_) {}
+        } catch (_) { }
         return (server.listenAddress || server.id || 'unknown').toString();
     },
 
@@ -581,45 +461,5 @@ const commands = [
                 ' | API: ' + plugin.config.apiUrl
             );
         }
-    },
-{
-    name: 'verify',
-    description: 'links your game account to your web profile using a verification code',
-    alias: 'vfy',
-    permission: 'User',
-    targetRequired: false,
-    arguments: [{
-        name: 'code',
-        required: true
-    }],
-    execute: (gameEvent) => {
-        if (!plugin.config.enabled) {
-            gameEvent.origin.tell('Match Stats API plugin is currently disabled.');
-            return;
-        }
-
-        var clientId = gameEvent.origin.clientId;
-        var now = Date.now();
-        var lastAttempt = plugin.verifyCooldowns[clientId] || 0;
-        if (now - lastAttempt < 10000) {
-            var remaining = Math.ceil((10000 - (now - lastAttempt)) / 1000);
-            gameEvent.origin.tell('Please wait ' + remaining + ' second(s) before trying again.');
-            return;
-        }
-
-        const code = (gameEvent.data || '').trim();
-        if (!code) {
-            gameEvent.origin.tell('Usage: !verify <code>  — enter the code shown on the website.');
-            return;
-        }
-
-        if (code.length > 16 || !/^[a-zA-Z0-9]+$/.test(code)) {
-            gameEvent.origin.tell('Invalid code format. Codes are short alphanumeric strings.');
-            return;
-        }
-
-        plugin.verifyCooldowns[clientId] = now;
-        plugin.postVerification(gameEvent.origin, code);
     }
-}
 ];
