@@ -151,6 +151,7 @@ const plugin = {
         this.matchData[serverKey] = {
             matchId: this.generateUUID(),
             startedAt: new Date(),
+            endDispatched: false,
             kills: {},
             deaths: {},
             damage: {}
@@ -222,7 +223,18 @@ const plugin = {
         }
 
         const serverKey = this.getServerKey(server);
-        this.ensureServerData(serverKey);
+        const serverData = this.matchData[serverKey];
+        if (!serverData) {
+            this.logDebug('{Name}: Ignoring MatchEnded on {Server} (no active match state)', this.name, serverKey);
+            return;
+        }
+
+        if (serverData.endDispatched) {
+            this.logDebug('{Name}: Ignoring duplicate MatchEnded on {Server} (already dispatched)', this.name, serverKey);
+            return;
+        }
+
+        serverData.endDispatched = true;
 
         const players = [];
         try {
@@ -237,11 +249,11 @@ const plugin = {
                     client_id: cid,
                     network_id: client.networkId ? client.networkId.toString() : '',
                     name: client.cleanedName || client.name || '',
-                    score: (this.matchData[serverKey].scores || {})[cid] || client.score || 0,
-                    kills: this.matchData[serverKey].kills[cid] || 0,
-                    deaths: this.matchData[serverKey].deaths[cid] || 0,
-                    killing_blow_damage: this.matchData[serverKey].damage[cid] || 0,
-                    team: (this.matchData[serverKey].teams || {})[cid] || ''
+                    score: (serverData.scores || {})[cid] || client.score || 0,
+                    kills: serverData.kills[cid] || 0,
+                    deaths: serverData.deaths[cid] || 0,
+                    killing_blow_damage: serverData.damage[cid] || 0,
+                    team: (serverData.teams || {})[cid] || ''
                 };
 
                 if (this.config.includeClientIp && client.iPAddressString) {
@@ -253,7 +265,7 @@ const plugin = {
 
             if (players.length === 0) {
                 const trackedIds = {};
-                const src = this.matchData[serverKey];
+                const src = serverData;
                 const buckets = [ src.kills || {}, src.deaths || {}, src.damage || {}, src.scores || {}, src.teams || {} ];
                 for (let b = 0; b < buckets.length; b++) {
                     const keys = Object.keys(buckets[b]);
@@ -282,11 +294,11 @@ const plugin = {
         }
 
         const endTime = new Date();
-        const startTime = this.matchData[serverKey].startedAt || endTime;
+        const startTime = serverData.startedAt || endTime;
         const durationSeconds = Math.round((endTime.getTime() - startTime.getTime()) / 1000);
 
         const payload = {
-            match_id: this.matchData[serverKey].matchId || this.generateUUID(),
+            match_id: serverData.matchId || this.generateUUID(),
             server_id: server.toString(),
             server_name: server.serverName || server.hostname || '',
             map_name: server.currentMap ? (server.currentMap.name || '') : '',
@@ -696,6 +708,7 @@ const plugin = {
             this.matchData[serverKey] = {
                 matchId: this.generateUUID(),
                 startedAt: new Date(),
+                endDispatched: false,
                 kills: {},
                 deaths: {},
                 damage: {},
