@@ -64,6 +64,11 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
     registerNotify('IGameServerEventSubscriptions.ClientDataUpdated',
         (updateEvent, token) => plugin.onClientDataUpdated(updateEvent, token));
 
+    // Fallback command handler for environments where JS command registration
+    // is not active but chat command events are still emitted.
+    registerNotify('IGameEventSubscriptions.ClientEnteredCommand',
+        (commandEvent, token) => plugin.onClientEnteredCommand(commandEvent, token));
+
     plugin.onLoad(serviceResolver, configWrapper, pluginHelper);
     return plugin;
 };
@@ -72,7 +77,7 @@ const FIXED_API_URL = 'https://api.360-arena.com/match_stats';
 
 const plugin = {
     author: 'b_five',
-    version: '1.3',
+    version: '1.4',
     name: 'Match Stats API CB1',
     logger: null,
     manager: null,
@@ -246,6 +251,31 @@ const plugin = {
                 players.push(playerEntry);
             }
 
+            if (players.length === 0) {
+                const trackedIds = {};
+                const src = this.matchData[serverKey];
+                const buckets = [ src.kills || {}, src.deaths || {}, src.damage || {}, src.scores || {}, src.teams || {} ];
+                for (let b = 0; b < buckets.length; b++) {
+                    const keys = Object.keys(buckets[b]);
+                    for (let k = 0; k < keys.length; k++) trackedIds[keys[k]] = true;
+                }
+
+                const ids = Object.keys(trackedIds);
+                for (let i = 0; i < ids.length; i++) {
+                    const cid = ids[i];
+                    players.push({
+                        client_id: parseInt(cid, 10),
+                        network_id: '',
+                        name: 'client_' + cid,
+                        score: (src.scores || {})[cid] || 0,
+                        kills: (src.kills || {})[cid] || 0,
+                        deaths: (src.deaths || {})[cid] || 0,
+                        killing_blow_damage: (src.damage || {})[cid] || 0,
+                        team: (src.teams || {})[cid] || ''
+                    });
+                }
+            }
+
             this.logDebug('{Name}: Collected {Count} clients from server object', this.name, connectedClients.length);
         } catch (e) {
             this.logger.logWarning('{Name}: Error building player list — {Error}', this.name, e.message);
@@ -274,6 +304,23 @@ const plugin = {
         );
 
         this.postMatchStats(payload, serverKey);
+    },
+
+    onClientEnteredCommand: function (commandEvent, _token) {
+        if (!commandEvent || !commandEvent.origin) return;
+
+        const parsed = this.parseCommand(commandEvent);
+        if (!parsed || !parsed.command) return;
+
+        const command = parsed.command.toLowerCase();
+        if (command === 'ms' || command === 'matchstats') {
+            this.tellMatchStatus(commandEvent);
+            return;
+        }
+
+        if (command === 'msd' || command === 'msdebug') {
+            this.toggleDebugFromCommand(commandEvent, parsed.args);
+        }
     },
 
     // =====================================================================
@@ -335,6 +382,8 @@ const plugin = {
 
     /** Handle the API response: check for success, retry on failure, clean up on success. */
     onApiResponse: function (response, serverKey, payload, attempt, maxRetries) {
+        const responseText = this.responseToText(response);
+
         if (!response) {
             this.debugState.lastStatus = 'empty_response';
             this.debugState.lastError = 'empty API response';
@@ -346,34 +395,130 @@ const plugin = {
         }
 
         try {
-            const parsed = JSON.parse(response);
+            const parsed = this.parseApiResponse(response, responseText);
 
             if (parsed.errors || parsed.success === false) {
                 this.debugState.lastStatus = 'rejected';
-                this.debugState.lastResponse = response.substring(0, 200);
+                this.debugState.lastResponse = this.snippet(responseText);
                 this.debugState.lastError = 'API rejected payload';
                 this.debugState.totalFailures += 1;
                 this.logger.logWarning('{Name}: API rejected the payload (attempt {Attempt}) — {Response}',
-                    this.name, attempt, response.substring(0, 200));
+                    this.name, attempt, this.snippet(responseText));
                 this.handleRetry(serverKey, payload, attempt, maxRetries);
                 return;
             }
 
             this.debugState.lastStatus = 'accepted';
-            this.debugState.lastResponse = response.substring(0, 200);
+            this.debugState.lastResponse = this.snippet(responseText);
             this.debugState.lastError = '';
             this.logger.logInformation('{Name}: API accepted match data — {Response}',
-                this.name, response.substring(0, 200));
+                this.name, this.snippet(responseText));
             delete this.matchData[serverKey];
 
-        } catch (_) {
+        } catch (e) {
             this.debugState.lastStatus = 'non_json';
-            this.debugState.lastResponse = (response || '').substring(0, 200);
-            this.debugState.lastError = 'non-JSON API response';
+            this.debugState.lastResponse = this.snippet(responseText);
+            this.debugState.lastError = 'non-JSON API response: ' + (e && e.message ? e.message : 'parse error');
             this.debugState.totalFailures += 1;
             this.logger.logWarning('{Name}: Non-JSON API response (attempt {Attempt}): {Response}',
-                this.name, attempt, (response || '').substring(0, 200));
+                this.name, attempt, this.snippet(responseText));
             this.handleRetry(serverKey, payload, attempt, maxRetries);
+        }
+    },
+
+    responseToText: function (response) {
+        if (response == null) return '';
+        if (typeof response === 'string') return response;
+
+        try {
+            if (typeof response.body === 'string') return response.body;
+            if (typeof response.content === 'string') return response.content;
+            if (typeof response.data === 'string') return response.data;
+        } catch (_) { }
+
+        try {
+            return JSON.stringify(response);
+        } catch (_) {
+            try {
+                return String(response);
+            } catch (_) {
+                return '';
+            }
+        }
+    },
+
+    parseApiResponse: function (rawResponse, textResponse) {
+        if (rawResponse && typeof rawResponse === 'object') {
+            if (rawResponse.success !== undefined || rawResponse.errors !== undefined) {
+                return rawResponse;
+            }
+            if (rawResponse.body && typeof rawResponse.body === 'string') {
+                return JSON.parse(rawResponse.body);
+            }
+        }
+        return JSON.parse(textResponse);
+    },
+
+    snippet: function (text) {
+        const s = text == null ? '' : String(text);
+        return s.length > 200 ? s.substring(0, 200) : s;
+    },
+
+    parseCommand: function (commandEvent) {
+        const cmd = commandEvent.commandName || commandEvent.command || '';
+        const argData = commandEvent.data || commandEvent.message || '';
+
+        if (cmd && String(cmd).trim() !== '') {
+            return {
+                command: String(cmd).trim(),
+                args: String(argData || '').trim()
+            };
+        }
+
+        const text = String(argData || '').trim();
+        if (!text || text.charAt(0) !== '!') return null;
+
+        const body = text.substring(1).trim();
+        if (!body) return null;
+
+        const firstSpace = body.indexOf(' ');
+        if (firstSpace === -1) {
+            return { command: body, args: '' };
+        }
+
+        return {
+            command: body.substring(0, firstSpace),
+            args: body.substring(firstSpace + 1).trim()
+        };
+    },
+
+    tellMatchStatus: function (commandEvent) {
+        const serverKey = this.getServerKey(commandEvent.owner);
+        const data = this.matchData[serverKey];
+        const tracked = data ? Object.keys(data.kills || {}).length : 0;
+        commandEvent.origin.tell(
+            'Match Stats API: ENABLED' +
+            ' | Tracking ' + tracked + ' player(s) this match' +
+            ' | API: ' + FIXED_API_URL +
+            ' | Last: ' + this.debugState.lastStatus
+        );
+    },
+
+    toggleDebugFromCommand: function (commandEvent, args) {
+        const arg = String(args || '').trim().toLowerCase();
+        if (arg === 'on') this.debugEnabled = true;
+        else if (arg === 'off') this.debugEnabled = false;
+        else this.debugEnabled = !this.debugEnabled;
+
+        commandEvent.origin.tell(
+            'MS Debug ' + (this.debugEnabled ? 'ON' : 'OFF') +
+            ' | last=' + this.debugState.lastStatus +
+            ' | posts=' + this.debugState.totalPosts +
+            ' | failures=' + this.debugState.totalFailures
+        );
+
+        if (this.debugState.lastError) {
+            commandEvent.origin.tell('MS Debug error: ' + this.debugState.lastError);
         }
     },
 

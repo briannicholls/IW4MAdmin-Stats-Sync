@@ -8,6 +8,8 @@ A JavaScript plugin for [IW4MAdmin](https://github.com/RaidMax/IW4M-Admin) that 
 2. Start (or restart) IW4MAdmin — the plugin loads automatically and writes its default configuration on first run.
 3. Edit the configuration to point at your API (see below), then reload or restart IW4MAdmin.
 
+If you previously deployed files with different names (for example `MatchStats_API.js`), keep only one active copy in the Plugins folder to avoid loading stale code.
+
 ## Configuration
 
 Configuration is managed through IW4MAdmin's built-in config system. On first load the plugin writes default values into:
@@ -108,6 +110,8 @@ The endpoint should return a JSON body. Non-JSON responses trigger a retry.
 ## Troubleshooting
 
 - **No data sent** — run `!ms` and `!msdebug on` and watch IW4MAdmin logs for `Match Stats API` lines.
+- **Runtime error mentioning `substring` on response** — you're running an older script build. Deploy the latest `MatchStatsAPI.js` and restart IW4MAdmin.
+- **Commands show unknown but plugin logs still appear** — some IW4MAdmin builds don't register JS commands consistently. This plugin includes a fallback command handler; ensure the startup log shows the latest plugin version.
 - **Timeout errors** — increase `timeoutMs` or check network connectivity between the IW4MAdmin host and your API.
 - **"All attempts failed"** — the POST failed on every attempt (initial + retries). Check your API availability, then consider increasing `maxRetries`.
 - **Stale match data after a server crash** — if a game server crashes mid-match without emitting `ShutdownGame`, the in-memory match data for that server lingers until the next match starts on the same server, at which point it is overwritten. This is not a memory leak in practice, but means the crashed match's stats are lost.
