@@ -77,7 +77,7 @@ const FIXED_API_URL = 'https://api.360-arena.com/match_stats';
 
 const plugin = {
     author: 'b_five',
-    version: '1.4',
+    version: '1.5',
     name: 'Match Stats API CB1',
     logger: null,
     manager: null,
@@ -340,7 +340,6 @@ const plugin = {
 
             const stringDict = System.Collections.Generic.Dictionary(System.String, System.String);
             const headers = new stringDict();
-            headers.add('Content-Type', 'application/json');
 
             if (this.config.apiKey) {
                 headers.add('Authorization', 'Bearer ' + this.config.apiKey);
@@ -397,10 +396,10 @@ const plugin = {
         try {
             const parsed = this.parseApiResponse(response, responseText);
 
-            if (parsed.errors || parsed.success === false) {
+            if (this.isApiFailure(parsed, responseText)) {
                 this.debugState.lastStatus = 'rejected';
                 this.debugState.lastResponse = this.snippet(responseText);
-                this.debugState.lastError = 'API rejected payload';
+                this.debugState.lastError = this.extractApiError(parsed) || 'API rejected payload';
                 this.debugState.totalFailures += 1;
                 this.logger.logWarning('{Name}: API rejected the payload (attempt {Attempt}) — {Response}',
                     this.name, attempt, this.snippet(responseText));
@@ -457,6 +456,48 @@ const plugin = {
             }
         }
         return JSON.parse(textResponse);
+    },
+
+    isApiFailure: function (parsed, textResponse) {
+        if (!parsed || typeof parsed !== 'object') {
+            return true;
+        }
+
+        if (parsed.errors || parsed.error || parsed.success === false) {
+            return true;
+        }
+
+        if (parsed.status && Number(parsed.status) >= 400) {
+            return true;
+        }
+
+        if (parsed.statusCode && Number(parsed.statusCode) >= 400) {
+            return true;
+        }
+
+        if (parsed.Message || parsed.ExceptionMessage || parsed.exception) {
+            return true;
+        }
+
+        const body = String(textResponse || '').toLowerCase();
+        if (body.indexOf('misused header name') !== -1 || body.indexOf('exception') !== -1) {
+            return true;
+        }
+
+        return false;
+    },
+
+    extractApiError: function (parsed) {
+        if (!parsed || typeof parsed !== 'object') return '';
+        if (typeof parsed.Message === 'string' && parsed.Message !== '') return parsed.Message;
+        if (typeof parsed.ExceptionMessage === 'string' && parsed.ExceptionMessage !== '') return parsed.ExceptionMessage;
+        if (typeof parsed.error === 'string' && parsed.error !== '') return parsed.error;
+        if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
+            const first = parsed.errors[0];
+            if (typeof first === 'string') return first;
+            if (first && typeof first.message === 'string') return first.message;
+        }
+        return '';
     },
 
     snippet: function (text) {
