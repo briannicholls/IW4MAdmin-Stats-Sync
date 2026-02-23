@@ -16,7 +16,7 @@ Configuration is managed through IW4MAdmin's built-in config system. On first lo
 <IW4MAdmin>/Configuration/ScriptPluginSettings.json
 ```
 
-All script plugin settings share this file. This plugin's settings are stored under the key `"Match Stats API"` → `"config"`. Edit that file directly to change settings, then restart IW4MAdmin to pick up the changes.
+All script plugin settings share this file. This plugin's settings are stored under the key `"Match Stats API CB1"` → `"config"`. Edit that file directly to change settings, then restart IW4MAdmin to pick up the changes.
 
 | Key | Type | Default | Description |
 |---|---|---|---|

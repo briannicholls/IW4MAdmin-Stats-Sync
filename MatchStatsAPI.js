@@ -72,8 +72,8 @@ const FIXED_API_URL = 'https://api.360-arena.com/match_stats';
 
 const plugin = {
     author: 'b_five',
-    version: '1.1',
-    name: 'Match Stats API',
+    version: '1.3',
+    name: 'Match Stats API CB1',
     logger: null,
     manager: null,
     configWrapper: null,
@@ -195,23 +195,12 @@ const plugin = {
         }
 
         if (updateEvent.clients) {
-            const clientsEnum = updateEvent.clients.getEnumerator
-                ? updateEvent.clients
-                : updateEvent.clients;
-
-            try {
-                const iter = clientsEnum.getEnumerator();
-                while (iter.moveNext()) {
-                    const client = iter.current;
-                    if (client) {
-                        this.matchData[serverKey].scores[client.clientId] = client.score || 0;
-                        this.matchData[serverKey].teams[client.clientId] = client.teamName || '';
-                    }
-                }
-            } catch (e) {
-                // Fallback: some collections expose forEach or direct indexing
-                this.logger.logDebug('{Name}: Could not enumerate clients in data update: {Error}',
-                    this.name, e.message);
+            const clients = this.toClientArray(updateEvent.clients);
+            for (let i = 0; i < clients.length; i++) {
+                const client = clients[i];
+                if (!client) continue;
+                this.matchData[serverKey].scores[client.clientId] = client.score || 0;
+                this.matchData[serverKey].teams[client.clientId] = client.teamName || '';
             }
         }
     },
@@ -232,11 +221,10 @@ const plugin = {
 
         const players = [];
         try {
-            const connectedClients = server.getClientsAsList();
-            const iter = connectedClients.getEnumerator();
+            const connectedClients = this.getConnectedClients(server);
 
-            while (iter.moveNext()) {
-                const client = iter.current;
+            for (let i = 0; i < connectedClients.length; i++) {
+                const client = connectedClients[i];
                 if (!client) continue;
 
                 const cid = client.clientId;
@@ -257,6 +245,8 @@ const plugin = {
 
                 players.push(playerEntry);
             }
+
+            this.logDebug('{Name}: Collected {Count} clients from server object', this.name, connectedClients.length);
         } catch (e) {
             this.logger.logWarning('{Name}: Error building player list — {Error}', this.name, e.message);
         }
@@ -427,6 +417,91 @@ const plugin = {
             if (key && key !== '') return key;
         } catch (_) { }
         return (server.listenAddress || server.id || 'unknown').toString();
+    },
+
+    getConnectedClients: function (server) {
+        if (!server) return [];
+
+        const candidates = [];
+
+        try {
+            if (typeof server.getClientsAsList === 'function') {
+                candidates.push(server.getClientsAsList());
+            }
+        } catch (_) { }
+
+        try {
+            if (typeof server.getClients === 'function') {
+                candidates.push(server.getClients());
+            }
+        } catch (_) { }
+
+        try {
+            if (server.clients) {
+                candidates.push(server.clients);
+            }
+        } catch (_) { }
+
+        try {
+            if (server.connectedClients) {
+                candidates.push(server.connectedClients);
+            }
+        } catch (_) { }
+
+        for (let i = 0; i < candidates.length; i++) {
+            const clients = this.toClientArray(candidates[i]);
+            if (clients.length > 0) {
+                return clients;
+            }
+        }
+
+        return [];
+    },
+
+    toClientArray: function (collection) {
+        if (!collection) return [];
+
+        if (Array.isArray(collection)) return collection;
+
+        try {
+            if (typeof collection.getEnumerator === 'function') {
+                const iter = collection.getEnumerator();
+                const out = [];
+                while (iter.moveNext()) {
+                    out.push(iter.current);
+                }
+                return out;
+            }
+        } catch (_) { }
+
+        try {
+            if (typeof collection.toArray === 'function') {
+                return collection.toArray();
+            }
+        } catch (_) { }
+
+        try {
+            if (typeof collection.forEach === 'function') {
+                const out = [];
+                collection.forEach(function (item) { out.push(item); });
+                return out;
+            }
+        } catch (_) { }
+
+        try {
+            if (typeof collection.values === 'function') {
+                const out = [];
+                const iter = collection.values();
+                while (true) {
+                    const next = iter.next();
+                    if (next.done) break;
+                    out.push(next.value);
+                }
+                return out;
+            }
+        } catch (_) { }
+
+        return [];
     },
 
     /** Lazily initialise the tracker object for a server. */
