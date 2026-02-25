@@ -77,8 +77,8 @@ const FIXED_API_URL = 'https://api.360-arena.com/match_stats';
 
 const plugin = {
     author: 'b_five',
-    version: '1.5',
-    name: 'Match Stats API CB1',
+    version: '1.6',
+    name: 'Match Stats API',
     logger: null,
     manager: null,
     configWrapper: null,
@@ -104,6 +104,7 @@ const plugin = {
     // --------------- per-server match trackers ---------------
     // Keyed by server endpoint string → { matchId, startedAt, kills, deaths, damage, ... }
     matchData: {},
+    recentMatchEnds: {},
 
     // =====================================================================
     //  Lifecycle
@@ -223,10 +224,11 @@ const plugin = {
         }
 
         const serverKey = this.getServerKey(server);
-        const serverData = this.matchData[serverKey];
+        let serverData = this.matchData[serverKey];
         if (!serverData) {
-            this.logDebug('{Name}: Ignoring MatchEnded on {Server} (no active match state)', this.name, serverKey);
-            return;
+            this.logDebug('{Name}: MatchEnded on {Server} had no active state; creating fallback state', this.name, serverKey);
+            this.ensureServerData(serverKey);
+            serverData = this.matchData[serverKey];
         }
 
         if (serverData.endDispatched) {
@@ -266,7 +268,7 @@ const plugin = {
             if (players.length === 0) {
                 const trackedIds = {};
                 const src = serverData;
-                const buckets = [ src.kills || {}, src.deaths || {}, src.damage || {}, src.scores || {}, src.teams || {} ];
+                const buckets = [src.kills || {}, src.deaths || {}, src.damage || {}, src.scores || {}, src.teams || {}];
                 for (let b = 0; b < buckets.length; b++) {
                     const keys = Object.keys(buckets[b]);
                     for (let k = 0; k < keys.length; k++) trackedIds[keys[k]] = true;
@@ -309,6 +311,14 @@ const plugin = {
             duration_seconds: durationSeconds,
             players: players
         };
+
+        if (this.shouldIgnoreDuplicateEnd(serverKey, payload)) {
+            this.logDebug('{Name}: Ignoring likely duplicate ghost match end on {Server}', this.name, serverKey);
+            delete this.matchData[serverKey];
+            return;
+        }
+
+        this.markRecentEnd(serverKey, payload);
 
         this.logger.logInformation(
             '{Name}: Match ended on {Server} with {Count} players — sending to API',
@@ -716,6 +726,55 @@ const plugin = {
                 teams: {}
             };
         }
+    },
+
+    buildPlayerFingerprint: function (players) {
+        const normalized = [];
+        for (let i = 0; i < players.length; i++) {
+            const p = players[i] || {};
+            normalized.push([
+                String(p.client_id || ''),
+                String(p.network_id || ''),
+                String(p.name || ''),
+                String(p.score || 0)
+            ].join(':'));
+        }
+        normalized.sort();
+        return normalized.join('|');
+    },
+
+    shouldIgnoreDuplicateEnd: function (serverKey, payload) {
+        const duration = parseInt(payload.duration_seconds, 10) || 0;
+        if (duration > 1) {
+            return false;
+        }
+
+        const players = Array.isArray(payload.players) ? payload.players : [];
+        if (players.length === 0) {
+            return true;
+        }
+
+        const recent = this.recentMatchEnds[serverKey];
+        if (!recent) {
+            return false;
+        }
+
+        const nowMs = Date.now();
+        const elapsedMs = nowMs - (recent.atMs || 0);
+        if (elapsedMs > 15000) {
+            return false;
+        }
+
+        const currentFingerprint = this.buildPlayerFingerprint(players);
+        return currentFingerprint !== '' && currentFingerprint === recent.playerFingerprint;
+    },
+
+    markRecentEnd: function (serverKey, payload) {
+        const players = Array.isArray(payload.players) ? payload.players : [];
+        this.recentMatchEnds[serverKey] = {
+            atMs: Date.now(),
+            playerFingerprint: this.buildPlayerFingerprint(players)
+        };
     },
 
     /** Generate a v4 UUID (Jint doesn't provide crypto.randomUUID). */
