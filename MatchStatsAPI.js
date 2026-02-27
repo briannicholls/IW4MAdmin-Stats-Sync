@@ -373,8 +373,6 @@ const plugin = {
     },
 
     readLeaderboardRows: function (cursorFromUtc) {
-        const sqliteNs = importNamespace('System.Data.SQLite');
-        const dbNull = System.DBNull.Value;
         const rows = [];
         let connection = null;
         let reader = null;
@@ -383,6 +381,13 @@ const plugin = {
         this.logDebug('{Name}: SQL query prepared (cursor={Cursor})', this.name, cursorFromUtc || '(none)');
 
         try {
+            const fileNs = importNamespace('System.IO');
+            if (!fileNs || !fileNs.File || !fileNs.File.Exists(this.config.dbPath)) {
+                throw new Error('SQLite DB file not found at configured dbPath: ' + this.config.dbPath);
+            }
+
+            const sqliteNs = this.getSqliteProvider();
+            const dbNull = System.DBNull.Value;
             connection = new sqliteNs.SQLiteConnection('Data Source=' + this.config.dbPath + ';Read Only=True;');
             connection.Open();
 
@@ -441,6 +446,14 @@ const plugin = {
         }
 
         return rows;
+    },
+
+    getSqliteProvider: function () {
+        try {
+            return importNamespace('System.Data.SQLite');
+        } catch (_) {
+            throw new Error('System.Data.SQLite namespace is unavailable in IW4M script runtime');
+        }
     },
 
     buildLeaderboardQuery: function (cursorFromUtc) {
