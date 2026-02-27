@@ -90,6 +90,10 @@ const plugin = {
 
         if (stored != null) {
             this.config = this.sanitizeConfig(stored);
+            if (this.shouldPersistSanitizedConfig(stored, this.config)) {
+                this.configWrapper.setValue('config', this.config);
+                this.logger.logInformation('{Name}: Config migrated with new defaults/keys', this.name);
+            }
         } else {
             this.configWrapper.setValue('config', this.config);
         }
@@ -723,6 +727,26 @@ const plugin = {
             maxRowsPerRequest: Number.isFinite(parsedBatchSize) && parsedBatchSize > 0 ? parsedBatchSize : 500,
             minSecondsBetweenSyncs: Number.isFinite(parsedCooldown) && parsedCooldown > 0 ? parsedCooldown : 20
         };
+    },
+
+    shouldPersistSanitizedConfig: function (stored, sanitized) {
+        const source = stored || {};
+
+        const sourceApiKey = source.apiKey == null ? '' : String(source.apiKey).trim();
+        const sourceApiUrl = source.apiUrl == null ? '' : String(source.apiUrl).trim();
+        const sourceDbPath = source.dbPath == null ? '' : String(source.dbPath).trim();
+        const sourceRetries = parseInt(source.maxRetries, 10);
+        const sourceBatchSize = parseInt(source.maxRowsPerRequest, 10);
+        const sourceCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+
+        if (sourceApiKey !== sanitized.apiKey) return true;
+        if (sourceApiUrl !== sanitized.apiUrl) return true;
+        if (sourceDbPath !== sanitized.dbPath) return true;
+        if (!(Number.isFinite(sourceRetries) && sourceRetries >= 0 && sourceRetries === sanitized.maxRetries)) return true;
+        if (!(Number.isFinite(sourceBatchSize) && sourceBatchSize > 0 && sourceBatchSize === sanitized.maxRowsPerRequest)) return true;
+        if (!(Number.isFinite(sourceCooldown) && sourceCooldown > 0 && sourceCooldown === sanitized.minSecondsBetweenSyncs)) return true;
+
+        return false;
     },
 
     logDebug: function () {
