@@ -1,5 +1,6 @@
 import { chunkRows, maxSourceUpdatedAt, generateUUID } from './utils.js';
 import { readLeaderboardRows } from './db.js';
+import { readLeaderboardRowsFromWebfront } from './webfront.js';
 import { postPayload } from './api.js';
 
 export function enqueueSync(plugin, trigger) {
@@ -39,49 +40,72 @@ export function enqueueSync(plugin, trigger) {
 
 function runSync(plugin, trigger, done) {
     const cursorFrom = plugin.runtime.lastCursorUtc || null;
-    const rows = readLeaderboardRows(
-        plugin.config.dbPath, cursorFrom, plugin.runtime.liveNameByNetworkId,
-        plugin.logger, plugin.debugState, plugin.name
-    );
-    const rowCount = rows.length;
+    readRows(plugin, cursorFrom, (error, rows) => {
+        if (error) {
+            plugin.debugState.lastStatus = 'read_error';
+            plugin.debugState.lastError = error && error.message ? error.message : 'unknown read error';
+            plugin.debugState.totalFailures += 1;
+            plugin.logger.logError('{Name}: Failed to read leaderboard data from {Source} - {Error}',
+                plugin.name,
+                plugin.config.statsSource || 'webfront',
+                plugin.debugState.lastError);
+            done();
+            return;
+        }
 
-    plugin.debugState.lastRowsRead = rowCount;
-    plugin.debugState.lastRowsSent = 0;
-    plugin.debugState.lastCursorFrom = cursorFrom || '';
+        const rowCount = rows.length;
 
-    if (rowCount === 0) {
-        plugin.debugState.lastStatus = 'no_changes';
-        plugin.debugState.lastError = '';
-        plugin.logger.logInformation('{Name}: No leaderboard changes since cursor {Cursor}', plugin.name, cursorFrom || '(none)');
-        done();
+        plugin.debugState.lastRowsRead = rowCount;
+        plugin.debugState.lastRowsSent = 0;
+        plugin.debugState.lastCursorFrom = cursorFrom || '';
+
+        if (rowCount === 0) {
+            plugin.debugState.lastStatus = 'no_changes';
+            plugin.debugState.lastError = '';
+            plugin.logger.logInformation('{Name}: No leaderboard changes since cursor {Cursor}', plugin.name, cursorFrom || '(none)');
+            done();
+            return;
+        }
+
+        const cursorTo = maxSourceUpdatedAt(rows);
+        plugin.debugState.lastCursorTo = cursorTo || '';
+        const batchId = generateUUID();
+        plugin.runtime.recentBatchId = batchId;
+        const chunks = chunkRows(rows, plugin.config.maxRowsPerRequest);
+
+        plugin.logger.logInformation('{Name}: Syncing {Rows} leaderboard rows in {Batches} batch(es)', plugin.name, rowCount, chunks.length);
+
+        sendBatchSequence(plugin, chunks, 0, {
+            batchId: batchId,
+            trigger: trigger,
+            cursorFrom: cursorFrom,
+            cursorTo: cursorTo
+        }, () => {
+            plugin.runtime.lastCursorUtc = cursorTo || plugin.runtime.lastCursorUtc;
+            if (plugin.runtime.lastCursorUtc) {
+                plugin.configWrapper.setValue('leaderboardCursorUtc', plugin.runtime.lastCursorUtc);
+            }
+            plugin.debugState.lastStatus = 'accepted';
+            plugin.debugState.lastError = '';
+            plugin.logger.logInformation('{Name}: Leaderboard sync completed. Cursor now {Cursor}', plugin.name, plugin.runtime.lastCursorUtc || '(none)');
+            done();
+        }, () => {
+            done();
+        });
+    });
+}
+
+function readRows(plugin, cursorFrom, done) {
+    if ((plugin.config.statsSource || 'webfront') === 'db') {
+        const rows = readLeaderboardRows(
+            plugin.config.dbPath, cursorFrom, plugin.runtime.liveNameByNetworkId,
+            plugin.logger, plugin.debugState, plugin.name
+        );
+        done(null, rows);
         return;
     }
 
-    const cursorTo = maxSourceUpdatedAt(rows);
-    plugin.debugState.lastCursorTo = cursorTo || '';
-    const batchId = generateUUID();
-    plugin.runtime.recentBatchId = batchId;
-    const chunks = chunkRows(rows, plugin.config.maxRowsPerRequest);
-
-    plugin.logger.logInformation('{Name}: Syncing {Rows} leaderboard rows in {Batches} batch(es)', plugin.name, rowCount, chunks.length);
-
-    sendBatchSequence(plugin, chunks, 0, {
-        batchId: batchId,
-        trigger: trigger,
-        cursorFrom: cursorFrom,
-        cursorTo: cursorTo
-    }, () => {
-        plugin.runtime.lastCursorUtc = cursorTo || plugin.runtime.lastCursorUtc;
-        if (plugin.runtime.lastCursorUtc) {
-            plugin.configWrapper.setValue('leaderboardCursorUtc', plugin.runtime.lastCursorUtc);
-        }
-        plugin.debugState.lastStatus = 'accepted';
-        plugin.debugState.lastError = '';
-        plugin.logger.logInformation('{Name}: Leaderboard sync completed. Cursor now {Cursor}', plugin.name, plugin.runtime.lastCursorUtc || '(none)');
-        done();
-    }, () => {
-        done();
-    });
+    readLeaderboardRowsFromWebfront(plugin, cursorFrom, done);
 }
 
 function sendBatchSequence(plugin, chunks, index, meta, onComplete, onFailure) {

@@ -28,9 +28,16 @@ var _b = (() => {
   // src/config.js
   var DEFAULT_API_URL = "https://api.360-arena.com/iw4m/leaderboard_snapshots";
   var DEFAULT_DB_PATH = "C:\\IW4Madmin\\Database\\Database.db";
+  var DEFAULT_WEBFRONT_BASE_URL = "http://127.0.0.1:1624";
   var defaultConfig = {
     apiKey: "",
     apiUrl: DEFAULT_API_URL,
+    statsSource: "webfront",
+    webfrontBaseUrl: DEFAULT_WEBFRONT_BASE_URL,
+    webfrontClientId: "",
+    webfrontPassword: "",
+    webfrontPageSize: 200,
+    webfrontMaxPages: 250,
     dbPath: DEFAULT_DB_PATH,
     maxRetries: 1,
     maxRowsPerRequest: 500,
@@ -49,11 +56,18 @@ var _b = (() => {
     const parsedRetries = parseInt(source.maxRetries, 10);
     const parsedBatchSize = parseInt(source.maxRowsPerRequest, 10);
     const parsedCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+    const parsedWebfrontPageSize = parseInt(source.webfrontPageSize, 10);
+    const parsedWebfrontMaxPages = parseInt(source.webfrontMaxPages, 10);
     const parsedThresholdLow = parseInt(source.discordThresholdLow, 10);
     const parsedThresholdHigh = parseInt(source.discordThresholdHigh, 10);
     const parsedDiscordPollInterval = parseInt(source.discordPollIntervalSeconds, 10);
     const apiKey = source.apiKey == null ? "" : String(source.apiKey).trim();
     const apiUrl = source.apiUrl == null || String(source.apiUrl).trim() === "" ? DEFAULT_API_URL : String(source.apiUrl).trim();
+    const statsSourceRaw = source.statsSource == null ? "webfront" : String(source.statsSource).trim().toLowerCase();
+    const statsSource = statsSourceRaw === "db" ? "db" : "webfront";
+    const webfrontBaseUrl = source.webfrontBaseUrl == null || String(source.webfrontBaseUrl).trim() === "" ? DEFAULT_WEBFRONT_BASE_URL : String(source.webfrontBaseUrl).trim().replace(/\/+$/, "");
+    const webfrontClientId = source.webfrontClientId == null ? "" : String(source.webfrontClientId).trim();
+    const webfrontPassword = source.webfrontPassword == null ? "" : String(source.webfrontPassword).trim();
     const dbPath = source.dbPath == null || String(source.dbPath).trim() === "" ? DEFAULT_DB_PATH : String(source.dbPath).trim();
     const discordWebhookUrl = source.discordWebhookUrl == null ? "" : String(source.discordWebhookUrl).trim();
     const discordBotToken = source.discordBotToken == null ? "" : String(source.discordBotToken).trim();
@@ -66,6 +80,12 @@ var _b = (() => {
     return {
       apiKey,
       apiUrl,
+      statsSource,
+      webfrontBaseUrl,
+      webfrontClientId,
+      webfrontPassword,
+      webfrontPageSize: Number.isFinite(parsedWebfrontPageSize) && parsedWebfrontPageSize >= 25 ? parsedWebfrontPageSize : 200,
+      webfrontMaxPages: Number.isFinite(parsedWebfrontMaxPages) && parsedWebfrontMaxPages >= 1 ? parsedWebfrontMaxPages : 250,
       dbPath,
       maxRetries: Number.isFinite(parsedRetries) && parsedRetries >= 0 ? parsedRetries : 1,
       maxRowsPerRequest: Number.isFinite(parsedBatchSize) && parsedBatchSize > 0 ? parsedBatchSize : 500,
@@ -485,6 +505,232 @@ var _b = (() => {
     done(false);
   }
 
+  // src/webfront.js
+  function createHeaders(cookieValue) {
+    const stringDict = System.Collections.Generic.Dictionary(System.String, System.String);
+    const headers = new stringDict();
+    if (cookieValue) {
+      headers.add("Cookie", cookieValue);
+    }
+    return headers;
+  }
+  function requestJson(plugin2, url, method, bodyObj, headers, done) {
+    try {
+      const pluginScript = importNamespace("IW4MAdmin.Application.Plugin.Script");
+      const body = bodyObj ? JSON.stringify(bodyObj) : "";
+      const request = new pluginScript.ScriptPluginWebRequest(
+        url,
+        body,
+        method,
+        "application/json",
+        headers
+      );
+      plugin2.pluginHelper.requestUrl(request, (response) => {
+        const text = responseToText(response);
+        if (String(text || "").trim() === "") {
+          done(true, null, text, response);
+          return;
+        }
+        try {
+          const parsed = parseApiResponse(response, text);
+          done(true, parsed, text, response);
+        } catch (_err) {
+          done(false, null, text, response);
+        }
+      });
+    } catch (error) {
+      done(false, null, error && error.message ? error.message : "request setup failed", null);
+    }
+  }
+  function getSetCookieHeader(response) {
+    if (!response) return "";
+    try {
+      if (response.headers && response.headers["Set-Cookie"]) {
+        return String(response.headers["Set-Cookie"]);
+      }
+      if (response.Headers && typeof response.Headers.GetValues === "function") {
+        const values = response.Headers.GetValues("Set-Cookie");
+        if (values && values.length > 0) return String(values[0]);
+      }
+    } catch (_) {
+    }
+    return "";
+  }
+  function cookieToSessionHeader(setCookieHeader) {
+    if (!setCookieHeader) return "";
+    const firstPart = String(setCookieHeader).split(";")[0];
+    return firstPart || "";
+  }
+  function normalizeTimestamp(value) {
+    if (value == null) return "";
+    return String(value).trim();
+  }
+  function pickValue(obj, paths, fallback) {
+    if (!obj || typeof obj !== "object") return fallback;
+    for (let i = 0; i < paths.length; i++) {
+      const p = paths[i];
+      if (!p) continue;
+      if (Object.prototype.hasOwnProperty.call(obj, p) && obj[p] != null) {
+        return obj[p];
+      }
+    }
+    return fallback;
+  }
+  function extractRows(parsed) {
+    if (!parsed) return [];
+    if (Array.isArray(parsed)) return parsed;
+    const candidates = ["results", "data", "players", "clients", "stats", "topStats", "Items", "items"];
+    for (let i = 0; i < candidates.length; i++) {
+      const key = candidates[i];
+      if (Array.isArray(parsed[key])) return parsed[key];
+    }
+    return [];
+  }
+  function normalizeOnePlayer(raw, liveNameByNetworkId) {
+    const networkIdRaw = pickValue(raw, ["networkId", "NetworkId", "clientGuid", "ClientGuid", "guid"], null);
+    const networkId = normalizeNetworkId(networkIdRaw);
+    if (!networkId) return null;
+    const gameNameRaw = pickValue(raw, ["gameName", "GameName", "game", "Game"], "unknown");
+    const gameName = String(gameNameRaw == null ? "unknown" : gameNameRaw).trim() || "unknown";
+    const nameRaw = pickValue(raw, ["name", "Name", "clientName", "ClientName", "alias", "Alias"], "");
+    const searchableRaw = pickValue(raw, ["searchableName", "SearchableName"], "");
+    const liveName = liveNameByNetworkId[networkId] || "";
+    const displayName = cleanName(liveName || nameRaw || "client_" + networkId);
+    const searchableName = cleanName(searchableRaw || displayName.toLowerCase());
+    const kills = parseInt(pickValue(raw, ["kills", "Kills", "totalKills", "TotalKills"], 0), 10) || 0;
+    const deaths = parseInt(pickValue(raw, ["deaths", "Deaths", "totalDeaths", "TotalDeaths"], 0), 10) || 0;
+    const timePlayed = parseInt(pickValue(raw, ["timePlayed", "TimePlayed", "totalTimePlayedSeconds", "TotalTimePlayedSeconds"], 0), 10) || 0;
+    const averageSpm = parseFloat(pickValue(raw, ["spm", "SPM", "averageSpm", "AverageSpm"], 0)) || 0;
+    const averageSkill = parseFloat(pickValue(raw, ["skill", "Skill", "averageSkill", "AverageSkill"], 0)) || 0;
+    const averageZScore = parseFloat(pickValue(raw, ["zScore", "ZScore", "averageZScore", "AverageZScore"], 0)) || 0;
+    const averageElo = parseFloat(pickValue(raw, ["eloRating", "EloRating", "averageEloRating", "AverageEloRating"], 0)) || 0;
+    const averageRwKdr = parseFloat(pickValue(raw, ["rollingWeightedKdr", "RollingWeightedKDR", "averageRollingWeightedKdr", "AverageRollingWeightedKDR"], 0)) || 0;
+    const totalConnections = parseInt(pickValue(raw, ["connections", "Connections", "totalConnections", "TotalConnections"], 0), 10) || 0;
+    const totalConnectionTime = parseInt(pickValue(raw, ["totalConnectionTime", "TotalConnectionTime", "totalConnectionTimeSeconds", "TotalConnectionTimeSeconds"], 0), 10) || 0;
+    const lastConnection = normalizeTimestamp(pickValue(raw, ["lastConnection", "LastConnection", "updatedAt", "UpdatedAt"], ""));
+    const sourceUpdatedAt = normalizeTimestamp(pickValue(raw, ["updatedAt", "UpdatedAt", "lastConnection", "LastConnection"], lastConnection));
+    return {
+      network_id: networkId,
+      game_name: gameName,
+      display_name: displayName,
+      searchable_name: searchableName,
+      total_kills: kills,
+      total_deaths: deaths,
+      total_time_played_seconds: timePlayed,
+      average_spm: Number(averageSpm.toFixed(4)),
+      average_skill: Number(averageSkill.toFixed(4)),
+      average_zscore: Number(averageZScore.toFixed(4)),
+      average_elo_rating: Number(averageElo.toFixed(4)),
+      average_rolling_weighted_kdr: Number(averageRwKdr.toFixed(4)),
+      total_connections: totalConnections,
+      total_connection_time_seconds: totalConnectionTime,
+      last_connection_utc: lastConnection,
+      source_updated_at_utc: sourceUpdatedAt,
+      stat_hash: computeStatHash(networkId, gameName, sourceUpdatedAt, kills, deaths, timePlayed)
+    };
+  }
+  function shouldIncludeByCursor(row, cursorFromUtc) {
+    if (!cursorFromUtc) return true;
+    const sourceUpdatedAt = row && row.source_updated_at_utc ? String(row.source_updated_at_utc) : "";
+    if (!sourceUpdatedAt) return true;
+    return sourceUpdatedAt > cursorFromUtc;
+  }
+  function fetchTopPage(plugin2, cookieHeader, offset, count, done) {
+    const url = plugin2.config.webfrontBaseUrl + "/api/stats/top?count=" + count + "&offset=" + offset;
+    requestJson(plugin2, url, "GET", null, createHeaders(cookieHeader), (ok, parsed, text, _response) => {
+      if (!ok) {
+        done(new Error("webfront /api/stats/top parse/request failed: " + snippet(text)), null);
+        return;
+      }
+      const rows = extractRows(parsed);
+      done(null, {
+        rows,
+        parsed
+      });
+    });
+  }
+  function loginWebfrontIfNeeded(plugin2, done) {
+    const clientId = String(plugin2.config.webfrontClientId || "").trim();
+    const password = String(plugin2.config.webfrontPassword || "").trim();
+    if (!clientId || !password) {
+      done(null, "");
+      return;
+    }
+    const url = plugin2.config.webfrontBaseUrl + "/api/client/" + encodeURIComponent(clientId) + "/login";
+    const headers = createHeaders("");
+    headers.add("Content-Type", "application/json");
+    requestJson(plugin2, url, "POST", { password }, headers, (ok, _parsed, text, response) => {
+      if (!ok) {
+        done(new Error("webfront login failed: " + snippet(text)), null);
+        return;
+      }
+      const setCookie = getSetCookieHeader(response);
+      const cookieHeader = cookieToSessionHeader(setCookie);
+      if (!cookieHeader) {
+        done(new Error("webfront login succeeded but no session cookie found"), null);
+        return;
+      }
+      done(null, cookieHeader);
+    });
+  }
+  function readLeaderboardRowsFromWebfront(plugin2, cursorFromUtc, done) {
+    loginWebfrontIfNeeded(plugin2, (loginError, cookieHeader) => {
+      if (loginError) {
+        done(loginError, []);
+        return;
+      }
+      const pageSize = Math.max(25, parseInt(plugin2.config.webfrontPageSize, 10) || 200);
+      const maxPages = Math.max(1, parseInt(plugin2.config.webfrontMaxPages, 10) || 250);
+      const byIdentity = {};
+      let skippedMissingNetwork = 0;
+      let page = 0;
+      const next = () => {
+        if (page >= maxPages) {
+          done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+          return;
+        }
+        const offset = page * pageSize;
+        fetchTopPage(plugin2, cookieHeader, offset, pageSize, (error, result) => {
+          if (error) {
+            done(error, []);
+            return;
+          }
+          const rawRows = result && result.rows ? result.rows : [];
+          if (page === 0 && plugin2.debugEnabled) {
+            const first = rawRows.length > 0 ? rawRows[0] : null;
+            if (first) {
+              plugin2.logDebug("{Name}: Webfront sample row keys: {Keys}", plugin2.name, Object.keys(first).join(","));
+            }
+          }
+          if (rawRows.length === 0) {
+            done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+            return;
+          }
+          for (let i = 0; i < rawRows.length; i++) {
+            const normalized = normalizeOnePlayer(rawRows[i], plugin2.runtime.liveNameByNetworkId || {});
+            if (!normalized) {
+              skippedMissingNetwork += 1;
+              continue;
+            }
+            if (!shouldIncludeByCursor(normalized, cursorFromUtc)) continue;
+            const key = normalized.game_name + ":" + normalized.network_id;
+            byIdentity[key] = normalized;
+          }
+          if (rawRows.length < pageSize) {
+            if (skippedMissingNetwork > 0) {
+              plugin2.logger.logWarning("{Name}: Webfront rows skipped due to missing network id: {Count}", plugin2.name, skippedMissingNetwork);
+            }
+            done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+            return;
+          }
+          page += 1;
+          next();
+        });
+      };
+      next();
+    });
+  }
+
   // src/sync.js
   function enqueueSync(plugin2, trigger) {
     if (plugin2.runtime.isSyncInFlight) {
@@ -520,48 +766,70 @@ var _b = (() => {
   }
   function runSync(plugin2, trigger, done) {
     const cursorFrom = plugin2.runtime.lastCursorUtc || null;
-    const rows = readLeaderboardRows(
-      plugin2.config.dbPath,
-      cursorFrom,
-      plugin2.runtime.liveNameByNetworkId,
-      plugin2.logger,
-      plugin2.debugState,
-      plugin2.name
-    );
-    const rowCount = rows.length;
-    plugin2.debugState.lastRowsRead = rowCount;
-    plugin2.debugState.lastRowsSent = 0;
-    plugin2.debugState.lastCursorFrom = cursorFrom || "";
-    if (rowCount === 0) {
-      plugin2.debugState.lastStatus = "no_changes";
-      plugin2.debugState.lastError = "";
-      plugin2.logger.logInformation("{Name}: No leaderboard changes since cursor {Cursor}", plugin2.name, cursorFrom || "(none)");
-      done();
+    readRows(plugin2, cursorFrom, (error, rows) => {
+      if (error) {
+        plugin2.debugState.lastStatus = "read_error";
+        plugin2.debugState.lastError = error && error.message ? error.message : "unknown read error";
+        plugin2.debugState.totalFailures += 1;
+        plugin2.logger.logError(
+          "{Name}: Failed to read leaderboard data from {Source} - {Error}",
+          plugin2.name,
+          plugin2.config.statsSource || "webfront",
+          plugin2.debugState.lastError
+        );
+        done();
+        return;
+      }
+      const rowCount = rows.length;
+      plugin2.debugState.lastRowsRead = rowCount;
+      plugin2.debugState.lastRowsSent = 0;
+      plugin2.debugState.lastCursorFrom = cursorFrom || "";
+      if (rowCount === 0) {
+        plugin2.debugState.lastStatus = "no_changes";
+        plugin2.debugState.lastError = "";
+        plugin2.logger.logInformation("{Name}: No leaderboard changes since cursor {Cursor}", plugin2.name, cursorFrom || "(none)");
+        done();
+        return;
+      }
+      const cursorTo = maxSourceUpdatedAt(rows);
+      plugin2.debugState.lastCursorTo = cursorTo || "";
+      const batchId = generateUUID();
+      plugin2.runtime.recentBatchId = batchId;
+      const chunks = chunkRows(rows, plugin2.config.maxRowsPerRequest);
+      plugin2.logger.logInformation("{Name}: Syncing {Rows} leaderboard rows in {Batches} batch(es)", plugin2.name, rowCount, chunks.length);
+      sendBatchSequence(plugin2, chunks, 0, {
+        batchId,
+        trigger,
+        cursorFrom,
+        cursorTo
+      }, () => {
+        plugin2.runtime.lastCursorUtc = cursorTo || plugin2.runtime.lastCursorUtc;
+        if (plugin2.runtime.lastCursorUtc) {
+          plugin2.configWrapper.setValue("leaderboardCursorUtc", plugin2.runtime.lastCursorUtc);
+        }
+        plugin2.debugState.lastStatus = "accepted";
+        plugin2.debugState.lastError = "";
+        plugin2.logger.logInformation("{Name}: Leaderboard sync completed. Cursor now {Cursor}", plugin2.name, plugin2.runtime.lastCursorUtc || "(none)");
+        done();
+      }, () => {
+        done();
+      });
+    });
+  }
+  function readRows(plugin2, cursorFrom, done) {
+    if ((plugin2.config.statsSource || "webfront") === "db") {
+      const rows = readLeaderboardRows(
+        plugin2.config.dbPath,
+        cursorFrom,
+        plugin2.runtime.liveNameByNetworkId,
+        plugin2.logger,
+        plugin2.debugState,
+        plugin2.name
+      );
+      done(null, rows);
       return;
     }
-    const cursorTo = maxSourceUpdatedAt(rows);
-    plugin2.debugState.lastCursorTo = cursorTo || "";
-    const batchId = generateUUID();
-    plugin2.runtime.recentBatchId = batchId;
-    const chunks = chunkRows(rows, plugin2.config.maxRowsPerRequest);
-    plugin2.logger.logInformation("{Name}: Syncing {Rows} leaderboard rows in {Batches} batch(es)", plugin2.name, rowCount, chunks.length);
-    sendBatchSequence(plugin2, chunks, 0, {
-      batchId,
-      trigger,
-      cursorFrom,
-      cursorTo
-    }, () => {
-      plugin2.runtime.lastCursorUtc = cursorTo || plugin2.runtime.lastCursorUtc;
-      if (plugin2.runtime.lastCursorUtc) {
-        plugin2.configWrapper.setValue("leaderboardCursorUtc", plugin2.runtime.lastCursorUtc);
-      }
-      plugin2.debugState.lastStatus = "accepted";
-      plugin2.debugState.lastError = "";
-      plugin2.logger.logInformation("{Name}: Leaderboard sync completed. Cursor now {Cursor}", plugin2.name, plugin2.runtime.lastCursorUtc || "(none)");
-      done();
-    }, () => {
-      done();
-    });
+    readLeaderboardRowsFromWebfront(plugin2, cursorFrom, done);
   }
   function sendBatchSequence(plugin2, chunks, index, meta, onComplete, onFailure) {
     if (index >= chunks.length) {
@@ -603,7 +871,7 @@ var _b = (() => {
     }
     return out;
   }
-  function createHeaders(config, includeJsonContentType) {
+  function createHeaders2(config, includeJsonContentType) {
     const stringDict = System.Collections.Generic.Dictionary(System.String, System.String);
     const headers = new stringDict();
     if (includeJsonContentType) {
@@ -616,7 +884,7 @@ var _b = (() => {
     }
     return headers;
   }
-  function requestJson(plugin2, url, method, bodyObj, headers, done) {
+  function requestJson2(plugin2, url, method, bodyObj, headers, done) {
     try {
       const pluginScript = importNamespace("IW4MAdmin.Application.Plugin.Script");
       const body = bodyObj ? JSON.stringify(bodyObj) : "";
@@ -716,8 +984,8 @@ var _b = (() => {
   }
   function sendDiscordWebhook(plugin2, messageText) {
     if (!plugin2.config.discordWebhookUrl) return;
-    const headers = createHeaders(plugin2.config, true);
-    requestJson(
+    const headers = createHeaders2(plugin2.config, true);
+    requestJson2(
       plugin2,
       plugin2.config.discordWebhookUrl,
       "POST",
@@ -732,9 +1000,9 @@ var _b = (() => {
   }
   function sendDiscordChannelMessage(plugin2, content) {
     if (!plugin2.config.discordBotToken || !plugin2.config.discordChannelId) return;
-    const headers = createHeaders(plugin2.config, true);
+    const headers = createHeaders2(plugin2.config, true);
     const url = "https://discord.com/api/v10/channels/" + plugin2.config.discordChannelId + "/messages";
-    requestJson(plugin2, url, "POST", { content }, headers, (ok, _parsed, text) => {
+    requestJson2(plugin2, url, "POST", { content }, headers, (ok, _parsed, text) => {
       if (!ok) {
         plugin2.logDebug("{Name}: Discord bot reply failed: {Error}", plugin2.name, snippet(text));
       }
@@ -954,9 +1222,9 @@ var _b = (() => {
     if (nowMs - plugin2.runtime.lastDiscordPollAtMs < minGap) return;
     plugin2.runtime.lastDiscordPollAtMs = nowMs;
     plugin2.runtime.discordPollInFlight = true;
-    const headers = createHeaders(plugin2.config, false);
+    const headers = createHeaders2(plugin2.config, false);
     const url = "https://discord.com/api/v10/channels/" + plugin2.config.discordChannelId + "/messages?limit=25";
-    requestJson(plugin2, url, "GET", null, headers, (ok, parsed, text) => {
+    requestJson2(plugin2, url, "GET", null, headers, (ok, parsed, text) => {
       plugin2.runtime.discordPollInFlight = false;
       if (!ok || !Array.isArray(parsed)) {
         plugin2.logDebug("{Name}: Discord poll failed: {Error}", plugin2.name, snippet(text));
@@ -1046,15 +1314,19 @@ var _b = (() => {
         if (newCfg) {
           plugin.config = sanitizeConfig(newCfg);
           plugin.logger.logInformation(
-            "{Name} config reloaded. API={Url} DB={Db}",
+            "{Name} config reloaded. API={Url} source={Source}",
             plugin.name,
             plugin.config.apiUrl,
-            plugin.config.dbPath
+            plugin.config.statsSource
           );
         }
       });
       if (stored != null) {
         this.config = sanitizeConfig(stored);
+        if (this.shouldPersistSanitizedConfig(stored, this.config)) {
+          this.configWrapper.setValue("config", this.config);
+          this.logger.logInformation("{Name}: Config migrated with new defaults/keys", this.name);
+        }
       } else {
         this.configWrapper.setValue("config", this.config);
       }
@@ -1067,12 +1339,12 @@ var _b = (() => {
         this.runtime.lastDiscordMessageId = String(savedDiscordMessageId);
       }
       this.logger.logInformation(
-        "{Name} {Version} by {Author} loaded. API={Url} DB={Db} Cursor={Cursor}",
+        "{Name} {Version} by {Author} loaded. API={Url} source={Source} Cursor={Cursor}",
         this.name,
         this.version,
         this.author,
         this.config.apiUrl,
-        this.config.dbPath,
+        this.config.statsSource,
         this.runtime.lastCursorUtc || "(none)"
       );
       if (!this.config.apiKey) {
@@ -1131,8 +1403,36 @@ var _b = (() => {
     },
     tellStatus: function(commandEvent) {
       commandEvent.origin.tell(
-        "Match Stats API: ENABLED | Mode: leaderboard snapshot | Last=" + this.debugState.lastStatus + " | Rows(read/sent)=" + this.debugState.lastRowsRead + "/" + this.debugState.lastRowsSent + " | Cursor=" + (this.runtime.lastCursorUtc || "(none)")
+        "Match Stats API: ENABLED | Mode: leaderboard snapshot | Source=" + (this.config.statsSource || "webfront") + " | Last=" + this.debugState.lastStatus + " | Rows(read/sent)=" + this.debugState.lastRowsRead + "/" + this.debugState.lastRowsSent + " | Cursor=" + (this.runtime.lastCursorUtc || "(none)")
       );
+    },
+    shouldPersistSanitizedConfig: function(stored, sanitized) {
+      const source = stored || {};
+      const sourceApiKey = source.apiKey == null ? "" : String(source.apiKey).trim();
+      const sourceApiUrl = source.apiUrl == null ? "" : String(source.apiUrl).trim();
+      const sourceStatsSource = source.statsSource == null ? "" : String(source.statsSource).trim().toLowerCase();
+      const sourceWebfrontBaseUrl = source.webfrontBaseUrl == null ? "" : String(source.webfrontBaseUrl).trim().replace(/\/+$/, "");
+      const sourceWebfrontClientId = source.webfrontClientId == null ? "" : String(source.webfrontClientId).trim();
+      const sourceWebfrontPassword = source.webfrontPassword == null ? "" : String(source.webfrontPassword).trim();
+      const sourceWebfrontPageSize = parseInt(source.webfrontPageSize, 10);
+      const sourceWebfrontMaxPages = parseInt(source.webfrontMaxPages, 10);
+      const sourceDbPath = source.dbPath == null ? "" : String(source.dbPath).trim();
+      const sourceRetries = parseInt(source.maxRetries, 10);
+      const sourceBatchSize = parseInt(source.maxRowsPerRequest, 10);
+      const sourceCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+      if (sourceApiKey !== sanitized.apiKey) return true;
+      if (sourceApiUrl !== sanitized.apiUrl) return true;
+      if (sourceStatsSource !== sanitized.statsSource) return true;
+      if (sourceWebfrontBaseUrl !== sanitized.webfrontBaseUrl) return true;
+      if (sourceWebfrontClientId !== sanitized.webfrontClientId) return true;
+      if (sourceWebfrontPassword !== sanitized.webfrontPassword) return true;
+      if (!(Number.isFinite(sourceWebfrontPageSize) && sourceWebfrontPageSize >= 25 && sourceWebfrontPageSize === sanitized.webfrontPageSize)) return true;
+      if (!(Number.isFinite(sourceWebfrontMaxPages) && sourceWebfrontMaxPages >= 1 && sourceWebfrontMaxPages === sanitized.webfrontMaxPages)) return true;
+      if (sourceDbPath !== sanitized.dbPath) return true;
+      if (!(Number.isFinite(sourceRetries) && sourceRetries >= 0 && sourceRetries === sanitized.maxRetries)) return true;
+      if (!(Number.isFinite(sourceBatchSize) && sourceBatchSize > 0 && sourceBatchSize === sanitized.maxRowsPerRequest)) return true;
+      if (!(Number.isFinite(sourceCooldown) && sourceCooldown > 0 && sourceCooldown === sanitized.minSecondsBetweenSyncs)) return true;
+      return false;
     },
     toggleDebugFromCommand: function(commandEvent, args) {
       const arg = String(args || "").trim().toLowerCase();
