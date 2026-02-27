@@ -1,71 +1,26 @@
 // =============================================================================
-// MatchStatsAPI.js — IW4MAdmin JavaScript Plugin
+// MatchStatsAPI.js - IW4MAdmin JavaScript Plugin
 // =============================================================================
-// Collects per-match player stats (kills, deaths, damage, etc.) and POSTs
-// them to an external API endpoint when each match ends.
+// Sends sanitized global leaderboard snapshots from IW4MAdmin SQLite data.
 //
-// INSTALLATION
-//   1. Copy this file into your IW4MAdmin "Plugins" folder.
-//   2. Start/restart IW4MAdmin — the plugin loads automatically.
-//   3. Edit the JSON config file written on first load (see below).
+// Trigger model:
+//   - MatchEnded: kicks off a sync run
+//   - ClientEnterMatch: caches latest live player names (display override)
 //
-// CONFIGURATION (stored automatically on first load)
-//   apiKey               – bearer / API key sent in headers    (default: empty)
-//   includeClientIp      – include player IP in payload        (default: false)
-//   maxRetries           – retry attempts on failed POST       (default: 1)
-//
-// COMMANDS
-//   !matchstats (!ms)  – [User] show current plugin status
-//   !msdebug           – [User] toggle debug logging on/off
-//
-// MATCH STATS PAYLOAD  (POST → apiUrl)
-//   {
-//     "match_id":         "<uuid>",
-//     "server_id":        "<IP:port>",
-//     "server_name":      "<server hostname>",
-//     "map_name":         "<current map>",
-//     "game":             "<game code, e.g. IW4, T6>",
-//     "game_type":        "<game mode, e.g. sd, dom, war>",
-//     "match_start_utc":  "<ISO timestamp>",
-//     "match_end_utc":    "<ISO timestamp>",
-//     "duration_seconds": 600,
-//     "players": [
-//       {
-//         "client_id":           123,
-//         "network_id":          "110000100000000",
-//         "name":                "PlayerName",
-//         "score":               1500,
-//         "kills":               12,
-//         "deaths":              4,
-//         "killing_blow_damage": 2400,
-//         "team":                "allies",
-//         "ip":                  "1.2.3.4"   // only if includeClientIp is true
-//       },
-//       ...
-//     ]
-//   }
+// Data model:
+//   - Reads cumulative totals from EFClientStatistics + EFClients + EFAlias
+//   - Sends only curated fields (no passwords/secrets/IP address)
+//   - Uses an updated-at cursor to ship only changed rows after first sync
 //
 // =============================================================================
 
 const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
-    // Subscribe to the MatchEnded event fired when the game log prints ShutdownGame
     registerNotify('IGameEventSubscriptions.MatchEnded',
         (matchEndEvent, token) => plugin.onMatchEnded(matchEndEvent, token));
 
-    // Subscribe to kill events so we can accumulate stats during the match
-    registerNotify('IGameEventSubscriptions.ClientKilled',
-        (killEvent, token) => plugin.onClientKilled(killEvent, token));
+    registerNotify('IGameEventSubscriptions.ClientEnterMatch',
+        (enterEvent, token) => plugin.onClientEnterMatch(enterEvent, token));
 
-    // Subscribe to match start to reset per-match trackers
-    registerNotify('IGameEventSubscriptions.MatchStarted',
-        (matchStartEvent, token) => plugin.onMatchStarted(matchStartEvent, token));
-
-    // Subscribe to client data updates to capture score snapshots
-    registerNotify('IGameServerEventSubscriptions.ClientDataUpdated',
-        (updateEvent, token) => plugin.onClientDataUpdated(updateEvent, token));
-
-    // Fallback command handler for environments where JS command registration
-    // is not active but chat command events are still emitted.
     registerNotify('IGameEventSubscriptions.ClientEnteredCommand',
         (commandEvent, token) => plugin.onClientEnteredCommand(commandEvent, token));
 
@@ -73,22 +28,25 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
     return plugin;
 };
 
-const FIXED_API_URL = 'https://api.360-arena.com/match_stats';
+const DEFAULT_API_URL = 'https://api.360-arena.com/iw4m/leaderboard_snapshots';
+const DEFAULT_DB_PATH = 'C:\\IW4Madmin\\Database\\Database.db';
 
 const plugin = {
     author: 'b_five',
-    version: '1.6',
+    version: '2.0',
     name: 'Match Stats API',
     logger: null,
     manager: null,
     configWrapper: null,
     pluginHelper: null,
 
-    // --------------- configuration defaults ---------------
     config: {
         apiKey: '',
-        includeClientIp: false,
-        maxRetries: 1
+        apiUrl: DEFAULT_API_URL,
+        dbPath: DEFAULT_DB_PATH,
+        maxRetries: 1,
+        maxRowsPerRequest: 500,
+        minSecondsBetweenSyncs: 20
     },
 
     debugEnabled: false,
@@ -98,17 +56,21 @@ const plugin = {
         lastError: '',
         lastResponse: '',
         totalPosts: 0,
-        totalFailures: 0
+        totalFailures: 0,
+        lastRowsRead: 0,
+        lastRowsSent: 0,
+        lastCursorFrom: '',
+        lastCursorTo: ''
     },
 
-    // --------------- per-server match trackers ---------------
-    // Keyed by server endpoint string → { matchId, startedAt, kills, deaths, damage, ... }
-    matchData: {},
-    recentMatchEnds: {},
-
-    // =====================================================================
-    //  Lifecycle
-    // =====================================================================
+    runtime: {
+        isSyncInFlight: false,
+        queuedSync: false,
+        lastTriggerAtMsByServer: {},
+        lastCursorUtc: null,
+        recentBatchId: null,
+        liveNameByNetworkId: {}
+    },
 
     onLoad: function (serviceResolver, configWrapper, pluginHelper) {
         this.configWrapper = configWrapper;
@@ -116,13 +78,13 @@ const plugin = {
         this.manager = serviceResolver.resolveService('IManager');
         this.logger = serviceResolver.resolveService('ILogger', ['ScriptPluginV2']);
 
-        // --- load persisted config or write defaults ---
         this.configWrapper.setName(this.name);
-        const stored = this.configWrapper.getValue('config', newCfg => {
+
+        const stored = this.configWrapper.getValue('config', (newCfg) => {
             if (newCfg) {
                 plugin.config = plugin.sanitizeConfig(newCfg);
-                plugin.logger.logInformation('{Name} config reloaded. URL={Url}',
-                    plugin.name, FIXED_API_URL);
+                plugin.logger.logInformation('{Name} config reloaded. API={Url} DB={Db}',
+                    plugin.name, plugin.config.apiUrl, plugin.config.dbPath);
             }
         });
 
@@ -132,9 +94,19 @@ const plugin = {
             this.configWrapper.setValue('config', this.config);
         }
 
+        const savedCursor = this.configWrapper.getValue('leaderboardCursorUtc', null);
+        if (savedCursor != null) {
+            this.runtime.lastCursorUtc = String(savedCursor);
+        }
+
         this.logger.logInformation(
-            '{Name} {Version} by {Author} loaded. API={Url}',
-            this.name, this.version, this.author, FIXED_API_URL
+            '{Name} {Version} by {Author} loaded. API={Url} DB={Db} Cursor={Cursor}',
+            this.name,
+            this.version,
+            this.author,
+            this.config.apiUrl,
+            this.config.dbPath,
+            this.runtime.lastCursorUtc || '(none)'
         );
 
         if (!this.config.apiKey) {
@@ -142,234 +114,169 @@ const plugin = {
         }
     },
 
-    // =====================================================================
-    //  Event Handlers
-    // =====================================================================
+    onClientEnterMatch: function (enterEvent, _token) {
+        const client = this.extractClientFromEvent(enterEvent);
+        if (!client) return;
 
-    /** Reset per-match data when a new match begins. */
-    onMatchStarted: function (matchStartEvent, _token) {
-        const serverKey = this.getServerKey(matchStartEvent.server);
-        this.matchData[serverKey] = {
-            matchId: this.generateUUID(),
-            startedAt: new Date(),
-            endDispatched: false,
-            kills: {},
-            deaths: {},
-            damage: {}
+        const networkId = this.normalizeNetworkId(client.networkId);
+        if (!networkId) return;
+
+        const liveName = this.cleanName(client.cleanedName || client.name || '');
+        if (!liveName) return;
+
+        this.runtime.liveNameByNetworkId[networkId] = liveName;
+        this.logDebug('{Name}: Live name cached net={Net} name={Player}', this.name, networkId, liveName);
+    },
+
+    onMatchEnded: function (matchEndEvent, _token) {
+        const server = matchEndEvent ? matchEndEvent.server : null;
+        const serverKey = this.getServerKey(server);
+        const nowMs = Date.now();
+        const minGapMs = Math.max(5, parseInt(this.config.minSecondsBetweenSyncs, 10) || 20) * 1000;
+        const prevMs = this.runtime.lastTriggerAtMsByServer[serverKey] || 0;
+
+        if (nowMs - prevMs < minGapMs) {
+            this.logDebug('{Name}: Ignoring duplicate trigger on {Server} (cooldown)', this.name, serverKey);
+            return;
+        }
+        this.runtime.lastTriggerAtMsByServer[serverKey] = nowMs;
+
+        const trigger = {
+            event: 'match_end',
+            occurred_at_utc: new Date().toISOString(),
+            server_id: server ? server.toString() : 'unknown',
+            server_name: server && (server.serverName || server.hostname) ? (server.serverName || server.hostname) : '',
+            map_name: server && server.currentMap ? (server.currentMap.name || '') : '',
+            game: server && server.gameName ? server.gameName.toString() : '',
+            game_type: server && server.gameType ? server.gameType.toString() : ''
         };
 
-        this.logger.logDebug('{Name}: Match started on {Server} (matchId={MatchId}) — trackers reset',
-            this.name, serverKey, this.matchData[serverKey].matchId);
+        this.logger.logInformation('{Name}: MatchEnded trigger received on {Server}; starting leaderboard sync', this.name, serverKey);
+        this.enqueueSync(trigger);
     },
 
-    /** Accumulate kill / death / damage tallies during the match. */
-    onClientKilled: function (killEvent, _token) {
-        const serverKey = this.getServerKey(killEvent.server);
-        this.ensureServerData(serverKey);
-
-        const attackerId = killEvent.attacker ? killEvent.attacker.clientId : null;
-        const victimId = killEvent.victim ? killEvent.victim.clientId : null;
-
-        // Tally kills for attacker (skip self-kills)
-        if (attackerId != null && attackerId !== victimId) {
-            this.matchData[serverKey].kills[attackerId] =
-                (this.matchData[serverKey].kills[attackerId] || 0) + 1;
-        }
-
-        // Tally deaths for victim
-        if (victimId != null) {
-            this.matchData[serverKey].deaths[victimId] =
-                (this.matchData[serverKey].deaths[victimId] || 0) + 1;
-        }
-
-        // Accumulate damage dealt
-        if (attackerId != null && killEvent.damage != null) {
-            this.matchData[serverKey].damage[attackerId] =
-                (this.matchData[serverKey].damage[attackerId] || 0) + parseInt(killEvent.damage);
-        }
-    },
-
-    /** Capture latest score from periodic client data updates. */
-    onClientDataUpdated: function (updateEvent, _token) {
-        const serverKey = this.getServerKey(updateEvent.server);
-        this.ensureServerData(serverKey);
-
-        if (!this.matchData[serverKey].scores) {
-            this.matchData[serverKey].scores = {};
-        }
-        if (!this.matchData[serverKey].teams) {
-            this.matchData[serverKey].teams = {};
-        }
-
-        if (updateEvent.clients) {
-            const clients = this.toClientArray(updateEvent.clients);
-            for (let i = 0; i < clients.length; i++) {
-                const client = clients[i];
-                if (!client) continue;
-                this.matchData[serverKey].scores[client.clientId] = client.score || 0;
-                this.matchData[serverKey].teams[client.clientId] = client.teamName || '';
-            }
-        }
-    },
-
-    /**
-     * Main handler — fires when the game log prints ShutdownGame.
-     * Gathers all accumulated data + live client info and POSTs to the API.
-     */
-    onMatchEnded: function (matchEndEvent, _token) {
-        const server = matchEndEvent.server;
-        if (!server) {
-            this.logger.logWarning('{Name}: MatchEnded event had no server reference', this.name);
+    enqueueSync: function (trigger) {
+        if (this.runtime.isSyncInFlight) {
+            this.runtime.queuedSync = true;
+            this.logDebug('{Name}: Sync already in flight, queueing another run', this.name);
             return;
         }
 
-        const serverKey = this.getServerKey(server);
-        let serverData = this.matchData[serverKey];
-        if (!serverData) {
-            this.logDebug('{Name}: MatchEnded on {Server} had no active state; creating fallback state', this.name, serverKey);
-            this.ensureServerData(serverKey);
-            serverData = this.matchData[serverKey];
-        }
+        this.runtime.isSyncInFlight = true;
+        this.runtime.queuedSync = false;
 
-        if (serverData.endDispatched) {
-            this.logDebug('{Name}: Ignoring duplicate MatchEnded on {Server} (already dispatched)', this.name, serverKey);
-            return;
-        }
-
-        serverData.endDispatched = true;
-
-        const players = [];
         try {
-            const connectedClients = this.getConnectedClients(server);
-
-            for (let i = 0; i < connectedClients.length; i++) {
-                const client = connectedClients[i];
-                if (!client) continue;
-
-                const cid = client.clientId;
-                const playerEntry = {
-                    client_id: cid,
-                    network_id: client.networkId ? client.networkId.toString() : '',
-                    name: client.cleanedName || client.name || '',
-                    score: (serverData.scores || {})[cid] || client.score || 0,
-                    kills: serverData.kills[cid] || 0,
-                    deaths: serverData.deaths[cid] || 0,
-                    killing_blow_damage: serverData.damage[cid] || 0,
-                    team: (serverData.teams || {})[cid] || ''
-                };
-
-                if (this.config.includeClientIp && client.iPAddressString) {
-                    playerEntry.ip = client.iPAddressString;
-                }
-
-                players.push(playerEntry);
-            }
-
-            if (players.length === 0) {
-                const trackedIds = {};
-                const src = serverData;
-                const buckets = [src.kills || {}, src.deaths || {}, src.damage || {}, src.scores || {}, src.teams || {}];
-                for (let b = 0; b < buckets.length; b++) {
-                    const keys = Object.keys(buckets[b]);
-                    for (let k = 0; k < keys.length; k++) trackedIds[keys[k]] = true;
-                }
-
-                const ids = Object.keys(trackedIds);
-                for (let i = 0; i < ids.length; i++) {
-                    const cid = ids[i];
-                    players.push({
-                        client_id: parseInt(cid, 10),
-                        network_id: '',
-                        name: 'client_' + cid,
-                        score: (src.scores || {})[cid] || 0,
-                        kills: (src.kills || {})[cid] || 0,
-                        deaths: (src.deaths || {})[cid] || 0,
-                        killing_blow_damage: (src.damage || {})[cid] || 0,
-                        team: (src.teams || {})[cid] || ''
+            this.runSync(trigger, () => {
+                this.runtime.isSyncInFlight = false;
+                if (this.runtime.queuedSync) {
+                    this.runtime.queuedSync = false;
+                    this.enqueueSync({
+                        event: 'queued_follow_up',
+                        occurred_at_utc: new Date().toISOString(),
+                        server_id: 'unknown',
+                        server_name: '',
+                        map_name: '',
+                        game: '',
+                        game_type: ''
                     });
                 }
-            }
+            });
+        } catch (error) {
+            this.runtime.isSyncInFlight = false;
+            this.debugState.lastStatus = 'sync_exception';
+            this.debugState.lastError = error && error.message ? error.message : 'unknown sync exception';
+            this.debugState.totalFailures += 1;
+            this.logger.logError('{Name}: Sync failed before dispatch - {Error}', this.name, this.debugState.lastError);
+        }
+    },
 
-            this.logDebug('{Name}: Collected {Count} clients from server object', this.name, connectedClients.length);
-        } catch (e) {
-            this.logger.logWarning('{Name}: Error building player list — {Error}', this.name, e.message);
+    runSync: function (trigger, done) {
+        const cursorFrom = this.runtime.lastCursorUtc || null;
+        const rows = this.readLeaderboardRows(cursorFrom);
+        const rowCount = rows.length;
+
+        this.debugState.lastRowsRead = rowCount;
+        this.debugState.lastRowsSent = 0;
+        this.debugState.lastCursorFrom = cursorFrom || '';
+
+        if (rowCount === 0) {
+            this.debugState.lastStatus = 'no_changes';
+            this.debugState.lastError = '';
+            this.logger.logInformation('{Name}: No leaderboard changes since cursor {Cursor}', this.name, cursorFrom || '(none)');
+            done();
+            return;
         }
 
-        const endTime = new Date();
-        const startTime = serverData.startedAt || endTime;
-        const durationSeconds = Math.round((endTime.getTime() - startTime.getTime()) / 1000);
+        const cursorTo = this.maxSourceUpdatedAt(rows);
+        this.debugState.lastCursorTo = cursorTo || '';
+        const batchId = this.generateUUID();
+        this.runtime.recentBatchId = batchId;
+        const chunks = this.chunkRows(rows, this.config.maxRowsPerRequest);
 
+        this.logger.logInformation('{Name}: Syncing {Rows} leaderboard rows in {Batches} batch(es)', this.name, rowCount, chunks.length);
+
+        this.sendBatchSequence(chunks, 0, {
+            batchId: batchId,
+            trigger: trigger,
+            cursorFrom: cursorFrom,
+            cursorTo: cursorTo
+        }, () => {
+            this.runtime.lastCursorUtc = cursorTo || this.runtime.lastCursorUtc;
+            if (this.runtime.lastCursorUtc) {
+                this.configWrapper.setValue('leaderboardCursorUtc', this.runtime.lastCursorUtc);
+            }
+            this.debugState.lastStatus = 'accepted';
+            this.debugState.lastError = '';
+            this.logger.logInformation('{Name}: Leaderboard sync completed. Cursor now {Cursor}', this.name, this.runtime.lastCursorUtc || '(none)');
+            done();
+        }, () => {
+            done();
+        });
+    },
+
+    sendBatchSequence: function (chunks, index, meta, onComplete, onFailure) {
+        if (index >= chunks.length) {
+            onComplete();
+            return;
+        }
+
+        const rows = chunks[index];
         const payload = {
-            match_id: serverData.matchId || this.generateUUID(),
-            server_id: server.toString(),
-            server_name: server.serverName || server.hostname || '',
-            map_name: server.currentMap ? (server.currentMap.name || '') : '',
-            game: server.gameName ? server.gameName.toString() : '',
-            game_type: server.gameType ? server.gameType.toString() : '',
-            match_start_utc: startTime.toISOString(),
-            match_end_utc: endTime.toISOString(),
-            duration_seconds: durationSeconds,
-            players: players
+            schema_version: 1,
+            source: 'iw4m_leaderboard_snapshot',
+            batch_id: meta.batchId,
+            batch_index: index,
+            batch_count: chunks.length,
+            cursor_from_utc: meta.cursorFrom,
+            cursor_to_utc: meta.cursorTo,
+            triggered_by: meta.trigger,
+            captured_at_utc: new Date().toISOString(),
+            players: rows
         };
 
-        if (this.shouldIgnoreDuplicateEnd(serverKey, payload)) {
-            this.logDebug('{Name}: Ignoring likely duplicate ghost match end on {Server}', this.name, serverKey);
-            delete this.matchData[serverKey];
-            return;
-        }
-
-        this.markRecentEnd(serverKey, payload);
-
-        this.logger.logInformation(
-            '{Name}: Match ended on {Server} with {Count} players — sending to API',
-            this.name, serverKey, players.length
-        );
-
-        this.postMatchStats(payload, serverKey);
+        this.postPayload(payload, 1, (ok) => {
+            if (!ok) {
+                onFailure();
+                return;
+            }
+            this.debugState.lastRowsSent += rows.length;
+            this.sendBatchSequence(chunks, index + 1, meta, onComplete, onFailure);
+        });
     },
 
-    onClientEnteredCommand: function (commandEvent, _token) {
-        if (!commandEvent || !commandEvent.origin) return;
-
-        const parsed = this.parseCommand(commandEvent);
-        if (!parsed || !parsed.command) return;
-
-        const command = parsed.command.toLowerCase();
-        if (command === 'ms' || command === 'matchstats') {
-            this.tellMatchStatus(commandEvent);
-            return;
-        }
-
-        if (command === 'msd' || command === 'msdebug') {
-            this.toggleDebugFromCommand(commandEvent, parsed.args);
-        }
-    },
-
-    // =====================================================================
-    //  HTTP POST
-    // =====================================================================
-
-    /**
-     * POST the match payload to the configured API endpoint.
-     * Cleans up matchData only after a successful response.
-     * Retries up to config.maxRetries times on failure.
-     */
-    postMatchStats: function (payload, serverKey, attempt) {
-        attempt = attempt || 1;
-
+    postPayload: function (payload, attempt, done) {
         try {
             const bodyJson = JSON.stringify(payload);
 
             const stringDict = System.Collections.Generic.Dictionary(System.String, System.String);
             const headers = new stringDict();
-
             if (this.config.apiKey) {
                 headers.add('Authorization', 'Bearer ' + this.config.apiKey);
             }
 
             const pluginScript = importNamespace('IW4MAdmin.Application.Plugin.Script');
             const request = new pluginScript.ScriptPluginWebRequest(
-                FIXED_API_URL,
+                this.config.apiUrl,
                 bodyJson,
                 'POST',
                 'application/json',
@@ -378,73 +285,269 @@ const plugin = {
 
             const currentAttempt = attempt;
             const maxRetries = this.config.maxRetries || 1;
-            const capturedPayload = payload;
-            const capturedServerKey = serverKey;
 
             this.pluginHelper.requestUrl(request, (response) => {
-                plugin.onApiResponse(response, capturedServerKey, capturedPayload, currentAttempt, maxRetries);
+                plugin.onApiResponse(response, payload, currentAttempt, maxRetries, done);
             });
 
             this.debugState.lastDispatchAt = new Date().toISOString();
             this.debugState.lastStatus = 'dispatched';
             this.debugState.totalPosts += 1;
             this.logDebug('{Name}: POST dispatched to {Url} ({Bytes} bytes, attempt {Attempt})',
-                this.name, FIXED_API_URL, bodyJson.length, attempt);
-
+                this.name, this.config.apiUrl, bodyJson.length, attempt);
         } catch (ex) {
             this.debugState.lastStatus = 'exception';
-            this.debugState.lastError = ex.message || 'unknown error';
+            this.debugState.lastError = ex && ex.message ? ex.message : 'unknown request exception';
             this.debugState.totalFailures += 1;
-            this.logger.logError('{Name}: Failed to POST match stats — {Error}',
-                this.name, ex.message);
-            delete this.matchData[serverKey];
+            this.logger.logError('{Name}: Failed to dispatch payload - {Error}', this.name, this.debugState.lastError);
+            done(false);
         }
     },
 
-    /** Handle the API response: check for success, retry on failure, clean up on success. */
-    onApiResponse: function (response, serverKey, payload, attempt, maxRetries) {
+    onApiResponse: function (response, payload, attempt, maxRetries, done) {
         const responseText = this.responseToText(response);
 
         if (!response) {
             this.debugState.lastStatus = 'empty_response';
             this.debugState.lastError = 'empty API response';
             this.debugState.totalFailures += 1;
-            this.logger.logWarning('{Name}: Empty response from API (attempt {Attempt})',
-                this.name, attempt);
-            this.handleRetry(serverKey, payload, attempt, maxRetries);
+            this.logger.logWarning('{Name}: Empty response from API (attempt {Attempt})', this.name, attempt);
+            this.handleRetry(payload, attempt, maxRetries, done);
             return;
         }
 
         try {
             const parsed = this.parseApiResponse(response, responseText);
-
             if (this.isApiFailure(parsed, responseText)) {
                 this.debugState.lastStatus = 'rejected';
                 this.debugState.lastResponse = this.snippet(responseText);
                 this.debugState.lastError = this.extractApiError(parsed) || 'API rejected payload';
                 this.debugState.totalFailures += 1;
-                this.logger.logWarning('{Name}: API rejected the payload (attempt {Attempt}) — {Response}',
-                    this.name, attempt, this.snippet(responseText));
-                this.handleRetry(serverKey, payload, attempt, maxRetries);
+                this.logger.logWarning('{Name}: API rejected batch {Batch}/{Count} (attempt {Attempt}) - {Response}',
+                    this.name,
+                    Number(payload.batch_index) + 1,
+                    payload.batch_count,
+                    attempt,
+                    this.snippet(responseText));
+                this.handleRetry(payload, attempt, maxRetries, done);
                 return;
             }
 
             this.debugState.lastStatus = 'accepted';
             this.debugState.lastResponse = this.snippet(responseText);
             this.debugState.lastError = '';
-            this.logger.logInformation('{Name}: API accepted match data — {Response}',
-                this.name, this.snippet(responseText));
-            delete this.matchData[serverKey];
-
+            this.logger.logInformation('{Name}: API accepted batch {Batch}/{Count}',
+                this.name,
+                Number(payload.batch_index) + 1,
+                payload.batch_count);
+            done(true);
         } catch (e) {
             this.debugState.lastStatus = 'non_json';
             this.debugState.lastResponse = this.snippet(responseText);
             this.debugState.lastError = 'non-JSON API response: ' + (e && e.message ? e.message : 'parse error');
             this.debugState.totalFailures += 1;
             this.logger.logWarning('{Name}: Non-JSON API response (attempt {Attempt}): {Response}',
-                this.name, attempt, this.snippet(responseText));
-            this.handleRetry(serverKey, payload, attempt, maxRetries);
+                this.name,
+                attempt,
+                this.snippet(responseText));
+            this.handleRetry(payload, attempt, maxRetries, done);
         }
+    },
+
+    handleRetry: function (payload, attempt, maxRetries, done) {
+        if (attempt < maxRetries + 1) {
+            this.logger.logInformation('{Name}: Retrying POST (attempt {Next} of {Max})',
+                this.name,
+                attempt + 1,
+                maxRetries + 1);
+            this.postPayload(payload, attempt + 1, done);
+            return;
+        }
+
+        this.logger.logError('{Name}: All {Max} attempt(s) failed for batch {Batch}/{Count}',
+            this.name,
+            maxRetries + 1,
+            Number(payload.batch_index) + 1,
+            payload.batch_count);
+        done(false);
+    },
+
+    readLeaderboardRows: function (cursorFromUtc) {
+        const sqliteNs = importNamespace('System.Data.SQLite');
+        const dbNull = System.DBNull.Value;
+        const rows = [];
+        let connection = null;
+        let reader = null;
+
+        const sql = this.buildLeaderboardQuery(cursorFromUtc);
+        this.logDebug('{Name}: SQL query prepared (cursor={Cursor})', this.name, cursorFromUtc || '(none)');
+
+        try {
+            connection = new sqliteNs.SQLiteConnection('Data Source=' + this.config.dbPath + ';Read Only=True;');
+            connection.Open();
+
+            const command = connection.CreateCommand();
+            command.CommandText = sql;
+            reader = command.ExecuteReader();
+
+            while (reader.Read()) {
+                const networkId = this.dbValueToString(reader['NetworkId'], dbNull);
+                if (!networkId) continue;
+
+                const sourceUpdatedAt = this.dbValueToString(reader['SourceUpdatedAt'], dbNull);
+                const liveName = this.runtime.liveNameByNetworkId[networkId] || '';
+                const aliasName = this.dbValueToString(reader['AliasName'], dbNull);
+                const displayName = this.cleanName(liveName || aliasName || ('client_' + networkId));
+
+                rows.push({
+                    network_id: networkId,
+                    game_name: this.dbValueToString(reader['GameName'], dbNull),
+                    display_name: displayName,
+                    searchable_name: this.dbValueToString(reader['SearchableName'], dbNull),
+                    total_kills: this.dbValueToInt(reader['Kills'], dbNull),
+                    total_deaths: this.dbValueToInt(reader['Deaths'], dbNull),
+                    total_time_played_seconds: this.dbValueToInt(reader['TimePlayed'], dbNull),
+                    average_spm: this.dbValueToFloat(reader['SPM'], dbNull),
+                    average_skill: this.dbValueToFloat(reader['Skill'], dbNull),
+                    average_zscore: this.dbValueToFloat(reader['ZScore'], dbNull),
+                    average_elo_rating: this.dbValueToFloat(reader['EloRating'], dbNull),
+                    average_rolling_weighted_kdr: this.dbValueToFloat(reader['RollingWeightedKDR'], dbNull),
+                    total_connections: this.dbValueToInt(reader['Connections'], dbNull),
+                    total_connection_time_seconds: this.dbValueToInt(reader['TotalConnectionTime'], dbNull),
+                    last_connection_utc: this.dbValueToString(reader['LastConnection'], dbNull),
+                    source_updated_at_utc: sourceUpdatedAt,
+                    stat_hash: this.computeStatHash(
+                        networkId,
+                        this.dbValueToString(reader['GameName'], dbNull),
+                        sourceUpdatedAt,
+                        this.dbValueToInt(reader['Kills'], dbNull),
+                        this.dbValueToInt(reader['Deaths'], dbNull),
+                        this.dbValueToInt(reader['TimePlayed'], dbNull)
+                    )
+                });
+            }
+        } catch (error) {
+            this.debugState.lastStatus = 'db_error';
+            this.debugState.lastError = error && error.message ? error.message : 'unknown db error';
+            this.debugState.totalFailures += 1;
+            this.logger.logError('{Name}: Failed to read SQLite data from {Db} - {Error}',
+                this.name,
+                this.config.dbPath,
+                this.debugState.lastError);
+            return [];
+        } finally {
+            try { if (reader) reader.Close(); } catch (_) { }
+            try { if (connection) connection.Close(); } catch (_) { }
+        }
+
+        return rows;
+    },
+
+    buildLeaderboardQuery: function (cursorFromUtc) {
+        let whereClause = 'WHERE c.Active = 1 AND c.NetworkId IS NOT NULL AND c.NetworkId != 0';
+        if (cursorFromUtc) {
+            whereClause += " AND COALESCE(s.UpdatedAt, c.LastConnection, c.FirstConnection) > '"
+                + this.escapeSqlLiteral(cursorFromUtc)
+                + "'";
+        }
+
+        return [
+            'SELECT',
+            '  c.NetworkId AS NetworkId,',
+            '  c.GameName AS GameName,',
+            '  COALESCE(a.Name, \"\") AS AliasName,',
+            '  COALESCE(a.SearchableName, \"\") AS SearchableName,',
+            '  SUM(s.Kills) AS Kills,',
+            '  SUM(s.Deaths) AS Deaths,',
+            '  SUM(s.TimePlayed) AS TimePlayed,',
+            '  AVG(s.SPM) AS SPM,',
+            '  AVG(s.Skill) AS Skill,',
+            '  AVG(s.ZScore) AS ZScore,',
+            '  AVG(s.EloRating) AS EloRating,',
+            '  AVG(s.RollingWeightedKDR) AS RollingWeightedKDR,',
+            '  MAX(c.Connections) AS Connections,',
+            '  MAX(c.TotalConnectionTime) AS TotalConnectionTime,',
+            '  MAX(c.LastConnection) AS LastConnection,',
+            '  MAX(COALESCE(s.UpdatedAt, c.LastConnection, c.FirstConnection)) AS SourceUpdatedAt',
+            'FROM EFClientStatistics s',
+            'INNER JOIN EFClients c ON c.ClientId = s.ClientId',
+            'LEFT JOIN EFAlias a ON a.AliasId = c.CurrentAliasId',
+            whereClause,
+            'GROUP BY c.NetworkId, c.GameName, a.Name, a.SearchableName',
+            'ORDER BY SourceUpdatedAt ASC, c.NetworkId ASC'
+        ].join(' ');
+    },
+
+    chunkRows: function (rows, chunkSize) {
+        const out = [];
+        const size = Math.max(1, parseInt(chunkSize, 10) || 500);
+        for (let i = 0; i < rows.length; i += size) {
+            out.push(rows.slice(i, i + size));
+        }
+        return out;
+    },
+
+    maxSourceUpdatedAt: function (rows) {
+        let maxValue = null;
+        for (let i = 0; i < rows.length; i++) {
+            const value = rows[i] && rows[i].source_updated_at_utc ? String(rows[i].source_updated_at_utc) : '';
+            if (!value) continue;
+            if (maxValue == null || value > maxValue) {
+                maxValue = value;
+            }
+        }
+        return maxValue;
+    },
+
+    extractClientFromEvent: function (eventObj) {
+        if (!eventObj) return null;
+        if (eventObj.client) return eventObj.client;
+        if (eventObj.origin) return eventObj.origin;
+        return null;
+    },
+
+    normalizeNetworkId: function (value) {
+        if (value == null) return '';
+        const normalized = String(value).trim();
+        if (!normalized || normalized === '0') return '';
+        return normalized;
+    },
+
+    cleanName: function (name) {
+        return String(name == null ? '' : name).replace(/[\x00-\x1F\x7F]/g, '').trim();
+    },
+
+    escapeSqlLiteral: function (value) {
+        return String(value == null ? '' : value).replace(/'/g, "''");
+    },
+
+    dbValueToString: function (value, dbNull) {
+        if (value == null || value === dbNull) return '';
+        return String(value);
+    },
+
+    dbValueToInt: function (value, dbNull) {
+        if (value == null || value === dbNull) return 0;
+        const parsed = parseInt(String(value), 10);
+        return Number.isFinite(parsed) ? parsed : 0;
+    },
+
+    dbValueToFloat: function (value, dbNull) {
+        if (value == null || value === dbNull) return 0;
+        const parsed = parseFloat(String(value));
+        return Number.isFinite(parsed) ? Number(parsed.toFixed(4)) : 0;
+    },
+
+    computeStatHash: function (networkId, gameName, sourceUpdatedAt, kills, deaths, timePlayed) {
+        const parts = [
+            String(networkId || ''),
+            String(gameName || ''),
+            String(sourceUpdatedAt || ''),
+            String(kills || 0),
+            String(deaths || 0),
+            String(timePlayed || 0)
+        ];
+        return parts.join(':');
     },
 
     responseToText: function (response) {
@@ -481,31 +584,16 @@ const plugin = {
     },
 
     isApiFailure: function (parsed, textResponse) {
-        if (!parsed || typeof parsed !== 'object') {
-            return true;
-        }
-
-        if (parsed.errors || parsed.error || parsed.success === false) {
-            return true;
-        }
-
-        if (parsed.status && Number(parsed.status) >= 400) {
-            return true;
-        }
-
-        if (parsed.statusCode && Number(parsed.statusCode) >= 400) {
-            return true;
-        }
-
-        if (parsed.Message || parsed.ExceptionMessage || parsed.exception) {
-            return true;
-        }
+        if (!parsed || typeof parsed !== 'object') return true;
+        if (parsed.errors || parsed.error || parsed.success === false) return true;
+        if (parsed.status && Number(parsed.status) >= 400) return true;
+        if (parsed.statusCode && Number(parsed.statusCode) >= 400) return true;
+        if (parsed.Message || parsed.ExceptionMessage || parsed.exception) return true;
 
         const body = String(textResponse || '').toLowerCase();
         if (body.indexOf('misused header name') !== -1 || body.indexOf('exception') !== -1) {
             return true;
         }
-
         return false;
     },
 
@@ -524,7 +612,7 @@ const plugin = {
 
     snippet: function (text) {
         const s = text == null ? '' : String(text);
-        return s.length > 200 ? s.substring(0, 200) : s;
+        return s.length > 220 ? s.substring(0, 220) : s;
     },
 
     parseCommand: function (commandEvent) {
@@ -555,15 +643,30 @@ const plugin = {
         };
     },
 
-    tellMatchStatus: function (commandEvent) {
-        const serverKey = this.getServerKey(commandEvent.owner);
-        const data = this.matchData[serverKey];
-        const tracked = data ? Object.keys(data.kills || {}).length : 0;
+    onClientEnteredCommand: function (commandEvent, _token) {
+        if (!commandEvent || !commandEvent.origin) return;
+
+        const parsed = this.parseCommand(commandEvent);
+        if (!parsed || !parsed.command) return;
+
+        const command = parsed.command.toLowerCase();
+        if (command === 'ms' || command === 'matchstats') {
+            this.tellStatus(commandEvent);
+            return;
+        }
+
+        if (command === 'msd' || command === 'msdebug') {
+            this.toggleDebugFromCommand(commandEvent, parsed.args);
+        }
+    },
+
+    tellStatus: function (commandEvent) {
         commandEvent.origin.tell(
             'Match Stats API: ENABLED' +
-            ' | Tracking ' + tracked + ' player(s) this match' +
-            ' | API: ' + FIXED_API_URL +
-            ' | Last: ' + this.debugState.lastStatus
+            ' | Mode: leaderboard snapshot' +
+            ' | Last=' + this.debugState.lastStatus +
+            ' | Rows(read/sent)=' + this.debugState.lastRowsRead + '/' + this.debugState.lastRowsSent +
+            ' | Cursor=' + (this.runtime.lastCursorUtc || '(none)')
         );
     },
 
@@ -588,10 +691,24 @@ const plugin = {
     sanitizeConfig: function (cfg) {
         const source = cfg || {};
         const parsedRetries = parseInt(source.maxRetries, 10);
+        const parsedBatchSize = parseInt(source.maxRowsPerRequest, 10);
+        const parsedCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+
+        const apiKey = source.apiKey == null ? '' : String(source.apiKey).trim();
+        const apiUrl = source.apiUrl == null || String(source.apiUrl).trim() === ''
+            ? DEFAULT_API_URL
+            : String(source.apiUrl).trim();
+        const dbPath = source.dbPath == null || String(source.dbPath).trim() === ''
+            ? DEFAULT_DB_PATH
+            : String(source.dbPath).trim();
+
         return {
-            apiKey: source.apiKey || '',
-            includeClientIp: source.includeClientIp === true,
-            maxRetries: Number.isFinite(parsedRetries) && parsedRetries >= 0 ? parsedRetries : 1
+            apiKey: apiKey,
+            apiUrl: apiUrl,
+            dbPath: dbPath,
+            maxRetries: Number.isFinite(parsedRetries) && parsedRetries >= 0 ? parsedRetries : 1,
+            maxRowsPerRequest: Number.isFinite(parsedBatchSize) && parsedBatchSize > 0 ? parsedBatchSize : 500,
+            minSecondsBetweenSyncs: Number.isFinite(parsedCooldown) && parsedCooldown > 0 ? parsedCooldown : 20
         };
     },
 
@@ -600,212 +717,33 @@ const plugin = {
         this.logger.logInformation.apply(this.logger, arguments);
     },
 
-    /** Retry a failed POST or give up and discard the data. */
-    handleRetry: function (serverKey, payload, attempt, maxRetries) {
-        if (attempt < maxRetries + 1) {
-            this.logger.logInformation('{Name}: Retrying POST (attempt {Next} of {Max})...',
-                this.name, attempt + 1, maxRetries + 1);
-            this.postMatchStats(payload, serverKey, attempt + 1);
-        } else {
-            this.logger.logError('{Name}: All {Max} attempt(s) failed — match data for {Server} has been lost',
-                this.name, maxRetries + 1, serverKey);
-            delete this.matchData[serverKey];
-        }
-    },
-
-    // =====================================================================
-    //  Helpers
-    // =====================================================================
-
-    /** Derive a stable key using IP:Port so it survives database rebuilds. */
     getServerKey: function (server) {
         if (!server) return 'unknown';
         try {
-            var key = server.toString();
+            const key = server.toString();
             if (key && key !== '') return key;
         } catch (_) { }
         return (server.listenAddress || server.id || 'unknown').toString();
     },
 
-    getConnectedClients: function (server) {
-        if (!server) return [];
-
-        const candidates = [];
-
-        try {
-            if (typeof server.getClientsAsList === 'function') {
-                candidates.push(server.getClientsAsList());
-            }
-        } catch (_) { }
-
-        try {
-            if (typeof server.getClients === 'function') {
-                candidates.push(server.getClients());
-            }
-        } catch (_) { }
-
-        try {
-            if (server.clients) {
-                candidates.push(server.clients);
-            }
-        } catch (_) { }
-
-        try {
-            if (server.connectedClients) {
-                candidates.push(server.connectedClients);
-            }
-        } catch (_) { }
-
-        for (let i = 0; i < candidates.length; i++) {
-            const clients = this.toClientArray(candidates[i]);
-            if (clients.length > 0) {
-                return clients;
-            }
-        }
-
-        return [];
-    },
-
-    toClientArray: function (collection) {
-        if (!collection) return [];
-
-        if (Array.isArray(collection)) return collection;
-
-        try {
-            if (typeof collection.getEnumerator === 'function') {
-                const iter = collection.getEnumerator();
-                const out = [];
-                while (iter.moveNext()) {
-                    out.push(iter.current);
-                }
-                return out;
-            }
-        } catch (_) { }
-
-        try {
-            if (typeof collection.toArray === 'function') {
-                return collection.toArray();
-            }
-        } catch (_) { }
-
-        try {
-            if (typeof collection.forEach === 'function') {
-                const out = [];
-                collection.forEach(function (item) { out.push(item); });
-                return out;
-            }
-        } catch (_) { }
-
-        try {
-            if (typeof collection.values === 'function') {
-                const out = [];
-                const iter = collection.values();
-                while (true) {
-                    const next = iter.next();
-                    if (next.done) break;
-                    out.push(next.value);
-                }
-                return out;
-            }
-        } catch (_) { }
-
-        return [];
-    },
-
-    /** Lazily initialise the tracker object for a server. */
-    ensureServerData: function (serverKey) {
-        if (!this.matchData[serverKey]) {
-            this.matchData[serverKey] = {
-                matchId: this.generateUUID(),
-                startedAt: new Date(),
-                endDispatched: false,
-                kills: {},
-                deaths: {},
-                damage: {},
-                scores: {},
-                teams: {}
-            };
-        }
-    },
-
-    buildPlayerFingerprint: function (players) {
-        const normalized = [];
-        for (let i = 0; i < players.length; i++) {
-            const p = players[i] || {};
-            normalized.push([
-                String(p.client_id || ''),
-                String(p.network_id || ''),
-                String(p.name || ''),
-                String(p.score || 0)
-            ].join(':'));
-        }
-        normalized.sort();
-        return normalized.join('|');
-    },
-
-    shouldIgnoreDuplicateEnd: function (serverKey, payload) {
-        const duration = parseInt(payload.duration_seconds, 10) || 0;
-        if (duration > 1) {
-            return false;
-        }
-
-        const players = Array.isArray(payload.players) ? payload.players : [];
-        if (players.length === 0) {
-            return true;
-        }
-
-        const recent = this.recentMatchEnds[serverKey];
-        if (!recent) {
-            return false;
-        }
-
-        const nowMs = Date.now();
-        const elapsedMs = nowMs - (recent.atMs || 0);
-        if (elapsedMs > 15000) {
-            return false;
-        }
-
-        const currentFingerprint = this.buildPlayerFingerprint(players);
-        return currentFingerprint !== '' && currentFingerprint === recent.playerFingerprint;
-    },
-
-    markRecentEnd: function (serverKey, payload) {
-        const players = Array.isArray(payload.players) ? payload.players : [];
-        this.recentMatchEnds[serverKey] = {
-            atMs: Date.now(),
-            playerFingerprint: this.buildPlayerFingerprint(players)
-        };
-    },
-
-    /** Generate a v4 UUID (Jint doesn't provide crypto.randomUUID). */
     generateUUID: function () {
         return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-            var r = Math.random() * 16 | 0;
+            const r = Math.random() * 16 | 0;
             return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
         });
     }
 };
 
-// IW4MAdmin requires this top-level array even if no custom commands are defined.
 const commands = [
     {
         name: 'matchstats',
-        description: 'shows current match stat tracking status',
+        description: 'shows current leaderboard snapshot sync status',
         alias: 'ms',
         permission: 'User',
         targetRequired: false,
         arguments: [],
         execute: (gameEvent) => {
-            const serverKey = plugin.getServerKey(gameEvent.owner);
-            const data = plugin.matchData[serverKey];
-            const tracked = data ? Object.keys(data.kills || {}).length : 0;
-
-            gameEvent.origin.tell(
-                'Match Stats API: ENABLED' +
-                ' | Tracking ' + tracked + ' player(s) this match' +
-                ' | API: ' + FIXED_API_URL +
-                ' | Last: ' + plugin.debugState.lastStatus
-            );
+            plugin.tellStatus(gameEvent);
         }
     },
     {
@@ -817,20 +755,7 @@ const commands = [
         arguments: [],
         execute: (gameEvent) => {
             const arg = (gameEvent.data || '').trim().toLowerCase();
-            if (arg === 'on') plugin.debugEnabled = true;
-            else if (arg === 'off') plugin.debugEnabled = false;
-            else plugin.debugEnabled = !plugin.debugEnabled;
-
-            gameEvent.origin.tell(
-                'MS Debug ' + (plugin.debugEnabled ? 'ON' : 'OFF') +
-                ' | last=' + plugin.debugState.lastStatus +
-                ' | posts=' + plugin.debugState.totalPosts +
-                ' | failures=' + plugin.debugState.totalFailures
-            );
-
-            if (plugin.debugState.lastError) {
-                gameEvent.origin.tell('MS Debug error: ' + plugin.debugState.lastError);
-            }
+            plugin.toggleDebugFromCommand(gameEvent, arg);
         }
     }
 ];

@@ -1,118 +1,118 @@
-# Match Stats API — IW4MAdmin Plugin
+# Match Stats API - IW4MAdmin Plugin
 
-A JavaScript plugin for [IW4MAdmin](https://github.com/RaidMax/IW4M-Admin) that collects per-match player statistics (kills, deaths, damage, score, team) and POSTs them to an external API when each match ends.
+JavaScript plugin for [IW4MAdmin](https://github.com/RaidMax/IW4M-Admin) that exports **sanitized leaderboard snapshots** from IW4MAdmin's SQLite database.
+
+This plugin no longer sends raw per-match kill-event payloads. It now sends curated cumulative player totals suitable for a global leaderboard.
+
+## What It Does
+
+- Triggers sync at match end (`MatchEnded`).
+- Reads cumulative stats from SQLite (`EFClientStatistics`, `EFClients`, `EFAlias`).
+- Sends only changed players using a persisted `updated_at` cursor.
+- Batches payloads for reliability.
+- Uses `ClientEnterMatch` to cache the latest live display names and prefer them over stale aliases.
 
 ## Installation
 
-1. Copy `MatchStatsAPI.js` into your IW4MAdmin **Plugins** folder.
-2. Start (or restart) IW4MAdmin — the plugin loads automatically and writes its default configuration on first run.
-3. Edit the configuration to point at your API (see below), then reload or restart IW4MAdmin.
-
-If you previously deployed files with different names (for example `MatchStats_API.js`), keep only one active copy in the Plugins folder to avoid loading stale code.
-
-## Configuration
-
-Configuration is managed through IW4MAdmin's built-in config system. On first load the plugin writes default values into:
+1. Copy `MatchStatsAPI.js` into your IW4MAdmin `Plugins` folder.
+2. Restart IW4MAdmin.
+3. Update plugin settings in:
 
 ```
 <IW4MAdmin>/Configuration/ScriptPluginSettings.json
 ```
 
-All script plugin settings share this file. This plugin's settings are stored under the key `"Match Stats API CB1"` → `"config"`. Edit that file directly to change settings, then restart IW4MAdmin to pick up the changes.
+Plugin settings are stored under your script plugin entry key in the `config` object.
+
+## Configuration
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `apiKey` | string | *(empty)* | Bearer token sent in the `Authorization` header of every request. |
-| `includeClientIp` | boolean | `false` | If `true`, each player object in the payload includes their IP address. |
-| `maxRetries` | number | `1` | Number of retry attempts when a POST fails. The plugin makes up to `1 + maxRetries` total attempts before discarding the data. |
+| `apiKey` | string | *(empty)* | Bearer token sent in `Authorization` header. |
+| `apiUrl` | string | `https://api.360-arena.com/iw4m/leaderboard_snapshots` | Snapshot ingest endpoint. |
+| `dbPath` | string | `C:\IW4Madmin\Database\Database.db` | Absolute SQLite DB file path on the IW4MAdmin host. |
+| `maxRetries` | number | `1` | Retry attempts per failed POST. Total attempts = `1 + maxRetries`. |
+| `maxRowsPerRequest` | number | `500` | Number of player rows per HTTP batch. |
+| `minSecondsBetweenSyncs` | number | `20` | Per-server cooldown to ignore duplicate `MatchEnded` triggers. |
 
-The endpoint is fixed in the plugin to:
+## Triggering
 
-`https://api.360-arena.com/match_stats`
+Sync runs on each match end signal. If a sync is already running, one follow-up sync is queued.
 
-In normal use, you only need to set `apiKey`.
+Because data is cumulative and cursor-based, duplicate triggers do not duplicate leaderboard totals on a correctly implemented API.
 
-## When Does the Sync Run?
+## Sanitized Payload
 
-Stats are collected continuously during a match and sent **once at match end**:
-
-1. **Match start** — all per-server tracking counters (kills, deaths, damage) are reset. A unique match ID (UUID) and start timestamp are generated.
-2. **During the match** — every kill event increments the attacker's kill count and the victim's death count, and accumulates killing-blow damage. Periodic client-data updates capture each player's score and team.
-3. **Match end** (`ShutdownGame` in the game log) — the plugin assembles the full payload from the accumulated data plus the current client list and POSTs it to the fixed ingest URL. Match data is only cleared after the API confirms receipt; on failure the plugin retries up to `maxRetries` times.
-
-No data is sent mid-match; there is exactly **one POST per completed match per server**.
-
-## In-Game Commands
-
-| Command | Alias | Permission | Description |
-|---|---|---|---|
-| `!matchstats` | `!ms` | User | Shows current tracking status, API URL, and last submit status. |
-| `!msdebug [on/off]` | `!msd` | User | Toggles verbose debug mode and prints last dispatch/error counters. |
-
-## API Payloads
-
-All payload keys use **snake_case** to align with typical Rails/API conventions.
-
-### Match Stats (`POST → https://api.360-arena.com/match_stats`)
-
-Sent automatically at the end of every match.
+The plugin posts JSON with this shape:
 
 ```json
 {
-  "match_id":         "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
-  "server_id":        "192.168.1.10:28960",
-  "server_name":      "My Game Server - Search & Destroy",
-  "map_name":         "mp_crash",
-  "game":             "IW4",
-  "game_type":        "sd",
-  "match_start_utc":  "2026-02-21T22:05:00.000Z",
-  "match_end_utc":    "2026-02-21T22:15:00.000Z",
-  "duration_seconds": 600,
+  "schema_version": 1,
+  "source": "iw4m_leaderboard_snapshot",
+  "batch_id": "uuid",
+  "batch_index": 0,
+  "batch_count": 3,
+  "cursor_from_utc": "2026-02-27 01:00:00.0000000",
+  "cursor_to_utc": "2026-02-27 01:05:00.0000000",
+  "triggered_by": {
+    "event": "match_end",
+    "occurred_at_utc": "2026-02-27T01:05:03.120Z",
+    "server_id": "1118226566",
+    "server_name": "Gun Game",
+    "map_name": "mp_terminal",
+    "game": "IW4",
+    "game_type": "dm"
+  },
+  "captured_at_utc": "2026-02-27T01:05:04.030Z",
   "players": [
     {
-      "client_id":           123,
-      "network_id":          "110000100000000",
-      "name":                "PlayerName",
-      "score":               1500,
-      "kills":               12,
-      "deaths":              4,
-      "killing_blow_damage": 2400,
-      "team":                "allies",
-      "ip":                  "1.2.3.4"
+      "network_id": "110000112345678",
+      "game_name": "13",
+      "display_name": "PlayerOne",
+      "searchable_name": "playerone",
+      "total_kills": 1234,
+      "total_deaths": 987,
+      "total_time_played_seconds": 45678,
+      "average_spm": 312.42,
+      "average_skill": 1.042,
+      "average_zscore": 0.3311,
+      "average_elo_rating": 998.42,
+      "average_rolling_weighted_kdr": 1.17,
+      "total_connections": 85,
+      "total_connection_time_seconds": 93211,
+      "last_connection_utc": "2026-02-27 01:04:44.5500000",
+      "source_updated_at_utc": "2026-02-27 01:04:44.5500000",
+      "stat_hash": "110000112345678:13:2026-02-27 01:04:44.5500000:1234:987:45678"
     }
   ]
 }
 ```
 
-> **`match_id`** is a UUID generated at match start. Your backend can use this to enforce uniqueness and safely ignore duplicate submissions caused by retries or network glitches.
+## Security Notes
 
-> **`server_id`** is the server's `IP:Port` string, which is stable across IW4MAdmin database rebuilds (unlike the auto-increment integer ID).
+- The plugin does **not** export password/salt/2FA fields.
+- The plugin does **not** export client IP addresses.
+- Run your API over HTTPS and validate bearer tokens.
 
-> **`game`** identifies the Call of Duty title — e.g. `IW3` (CoD4), `IW4` (MW2), `IW5` (MW3), `T5` (BO1), `T6` (BO2). The `game_type` field is the game *mode* shortcode (e.g. `war` = TDM, `dom` = Domination, `sd` = Search & Destroy).
+## In-Game Commands
 
-> **`killing_blow_damage`** is the sum of final-hit damage from kills, not total damage dealt during the match. IW4MAdmin only exposes per-kill damage (the damage of the shot that secured the kill), so a player who deals significant chip damage but gets no kills will show `0`. Keep this in mind when interpreting the data.
+| Command | Alias | Permission | Description |
+|---|---|---|---|
+| `!matchstats` | `!ms` | User | Shows snapshot mode, last status, row counts, and cursor. |
+| `!msdebug [on/off]` | `!msd` | User | Toggles verbose plugin logging and prints last API error. |
 
-> The payload includes bots and human players. The `ip` field is only included when `includeClientIp` is `true`.
+## API Expectations
 
-**Headers sent with every request:**
+Your endpoint should:
 
-- `Content-Type: application/json`
-- `Authorization: Bearer <apiKey>` (only if `apiKey` is set)
-
-## Building Your API Endpoint
-
-Your receiving API needs to handle one route:
-
-1. **`POST /match_stats`** — accept the match payload, validate the bearer token, and store the data. Use `match_id` as a unique key to safely handle duplicate submissions. Return a JSON body; the plugin checks for `success` and `errors` fields to determine whether to retry.
-
-The endpoint should return a JSON body. Non-JSON responses trigger a retry.
+1. Validate bearer token.
+2. Treat each player row as an idempotent upsert (recommended key: `network_id + game_name`, with `source_updated_at_utc` staleness checks).
+3. Handle batched payloads.
+4. Return JSON. Non-JSON responses are treated as retryable failure.
 
 ## Troubleshooting
 
-- **No data sent** — run `!ms` and `!msdebug on` and watch IW4MAdmin logs for `Match Stats API` lines.
-- **Runtime error mentioning `substring` on response** — you're running an older script build. Deploy the latest `MatchStatsAPI.js` and restart IW4MAdmin.
-- **Commands show unknown but plugin logs still appear** — some IW4MAdmin builds don't register JS commands consistently. This plugin includes a fallback command handler; ensure the startup log shows the latest plugin version.
-- **Timeout errors** — increase `timeoutMs` or check network connectivity between the IW4MAdmin host and your API.
-- **"All attempts failed"** — the POST failed on every attempt (initial + retries). Check your API availability, then consider increasing `maxRetries`.
-- **Stale match data after a server crash** — if a game server crashes mid-match without emitting `ShutdownGame`, the in-memory match data for that server lingers until the next match starts on the same server, at which point it is overwritten. This is not a memory leak in practice, but means the crashed match's stats are lost.
-- Check the IW4MAdmin log for entries prefixed with `Match Stats API` for detailed diagnostics.
+- **No rows sent**: check if `cursor_from_utc` is ahead of source updates; clear cursor in plugin settings if needed.
+- **DB read error**: confirm `dbPath` exists and IW4MAdmin process can read it.
+- **401/403**: verify `apiKey` and API auth middleware.
+- **Repeated retries**: inspect IW4MAdmin logs for `Match Stats API` entries and API response body snippet.
