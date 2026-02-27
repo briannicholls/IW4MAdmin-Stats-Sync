@@ -3,6 +3,40 @@ import {
     dbValueToString, dbValueToInt, dbValueToFloat, computeStatHash
 } from './utils.js';
 
+function tryCreateConnection(providerName, className, connectionString) {
+    try {
+        const provider = importNamespace(providerName);
+        if (!provider || typeof provider[className] !== 'function') {
+            return null;
+        }
+        return new provider[className](connectionString);
+    } catch (_) {
+        return null;
+    }
+}
+
+function createSqliteConnection(dbPath) {
+    const systemConnection = tryCreateConnection(
+        'System.Data.SQLite',
+        'SQLiteConnection',
+        'Data Source=' + dbPath + ';Read Only=True;'
+    );
+    if (systemConnection) {
+        return systemConnection;
+    }
+
+    const microsoftConnection = tryCreateConnection(
+        'Microsoft.Data.Sqlite',
+        'SqliteConnection',
+        'Data Source=' + dbPath + ';Mode=ReadOnly;'
+    );
+    if (microsoftConnection) {
+        return microsoftConnection;
+    }
+
+    throw new Error('No supported SQLite provider found (System.Data.SQLite or Microsoft.Data.Sqlite).');
+}
+
 export function buildLeaderboardQuery(cursorFromUtc) {
     let whereClause = 'WHERE c.Active = 1 AND c.NetworkId IS NOT NULL AND c.NetworkId != 0';
     if (cursorFromUtc) {
@@ -39,7 +73,6 @@ export function buildLeaderboardQuery(cursorFromUtc) {
 }
 
 export function readLeaderboardRows(dbPath, cursorFromUtc, liveNameByNetworkId, logger, debugState, pluginName) {
-    const sqliteNs = importNamespace('System.Data.SQLite');
     const dbNull = System.DBNull.Value;
     const rows = [];
     let connection = null;
@@ -48,7 +81,7 @@ export function readLeaderboardRows(dbPath, cursorFromUtc, liveNameByNetworkId, 
     const sql = buildLeaderboardQuery(cursorFromUtc);
 
     try {
-        connection = new sqliteNs.SQLiteConnection('Data Source=' + dbPath + ';Read Only=True;');
+        connection = createSqliteConnection(dbPath);
         connection.Open();
 
         const command = connection.CreateCommand();
