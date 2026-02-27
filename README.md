@@ -1,6 +1,6 @@
 # Match Stats API - IW4MAdmin Plugin
 
-JavaScript plugin for [IW4MAdmin](https://github.com/RaidMax/IW4M-Admin) that exports **sanitized leaderboard snapshots** using IW4M Webfront API (default) or SQLite (optional fallback).
+JavaScript plugin for [IW4MAdmin](https://github.com/RaidMax/IW4M-Admin) that exports **sanitized leaderboard snapshots** using IW4M Webfront API.
 
 This plugin no longer sends raw per-match kill-event payloads. It now sends curated cumulative player totals suitable for a global leaderboard.
 
@@ -9,8 +9,7 @@ It can also post Discord population alerts and (optionally) accept admin command
 ## What It Does
 
 - Triggers sync at match end (`MatchEnded`).
-- Reads cumulative stats from IW4M Webfront API (`/api/stats/top`) by default.
-- Optional fallback: reads directly from SQLite when `statsSource` is set to `db`.
+- Reads cumulative stats from IW4M Webfront API (`/api/stats/top`).
 - Sends only changed players using a persisted `updated_at` cursor.
 - Batches payloads for reliability.
 - Uses `ClientEnterMatch` to cache the latest live display names and prefer them over stale aliases.
@@ -110,7 +109,7 @@ Command example config:
 |---|---|---|---|
 | `apiKey` | string | *(empty)* | Bearer token sent in `Authorization` header. |
 | `apiUrl` | string | `https://api.360-arena.com/iw4m/leaderboard_snapshots` | Snapshot ingest endpoint. |
-| `statsSource` | string | `webfront` | Data source mode: `webfront` (recommended) or `db`. |
+| `statsSource` | string | `webfront` | Reserved for future source modes; current runtime uses Webfront API. |
 | `webfrontBaseUrl` | string | `http://127.0.0.1:1624` | IW4M Webfront base URL. |
 | `webfrontClientId` | string | *(empty)* | Optional client ID for Webfront login. |
 | `webfrontPassword` | string | *(empty)* | Optional password for Webfront login. |
@@ -230,6 +229,6 @@ Your endpoint should:
 
 - **No rows sent**: check if `cursor_from_utc` is ahead of source updates; clear cursor in plugin settings if needed.
 - **Webfront read error**: confirm `webfrontBaseUrl` is reachable from IW4MAdmin host (usually `http://127.0.0.1:1624`).
-- **DB read error**: only applies when `statsSource` is `db`; confirm `dbPath` exists and SQLite provider is available in IW4M script runtime.
+- **DB read error**: not used in current runtime path; Webfront API is the active source.
 - **401/403**: verify `apiKey` and API auth middleware.
 - **Repeated retries**: inspect IW4MAdmin logs for `Match Stats API` entries and API response body snippet.

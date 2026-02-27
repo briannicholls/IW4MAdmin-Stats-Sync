@@ -139,6 +139,37 @@ function normalizeOnePlayer(raw, liveNameByNetworkId) {
     };
 }
 
+function summarizeFieldCoverage(rows) {
+    const coverage = {
+        with_kills: 0,
+        with_deaths: 0,
+        with_time_played: 0,
+        with_spm: 0,
+        with_skill: 0,
+        with_zscore: 0,
+        with_elo: 0,
+        with_rw_kdr: 0,
+        with_connections: 0,
+        with_source_updated_at: 0
+    };
+
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i] || {};
+        if (Number(row.total_kills || 0) > 0) coverage.with_kills += 1;
+        if (Number(row.total_deaths || 0) > 0) coverage.with_deaths += 1;
+        if (Number(row.total_time_played_seconds || 0) > 0) coverage.with_time_played += 1;
+        if (Number(row.average_spm || 0) > 0) coverage.with_spm += 1;
+        if (Number(row.average_skill || 0) > 0) coverage.with_skill += 1;
+        if (Number(row.average_zscore || 0) !== 0) coverage.with_zscore += 1;
+        if (Number(row.average_elo_rating || 0) > 0) coverage.with_elo += 1;
+        if (Number(row.average_rolling_weighted_kdr || 0) > 0) coverage.with_rw_kdr += 1;
+        if (Number(row.total_connections || 0) > 0) coverage.with_connections += 1;
+        if (String(row.source_updated_at_utc || '').trim() !== '') coverage.with_source_updated_at += 1;
+    }
+
+    return coverage;
+}
+
 function shouldIncludeByCursor(row, cursorFromUtc) {
     if (!cursorFromUtc) return true;
     const sourceUpdatedAt = row && row.source_updated_at_utc ? String(row.source_updated_at_utc) : '';
@@ -206,7 +237,16 @@ export function readLeaderboardRowsFromWebfront(plugin, cursorFromUtc, done) {
 
         const next = () => {
             if (page >= maxPages) {
-                done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+                const finalRows = Object.keys(byIdentity).map((k) => byIdentity[k]);
+                const sample = finalRows.length > 0 ? JSON.stringify(finalRows[0]).substring(0, 700) : '{}';
+                const coverage = summarizeFieldCoverage(finalRows);
+                plugin.logger.logWarning('{Name}: Reached webfrontMaxPages={MaxPages}. Returning {Rows} rows. Coverage={Coverage} Sample={Sample}',
+                    plugin.name,
+                    maxPages,
+                    finalRows.length,
+                    JSON.stringify(coverage),
+                    sample);
+                done(null, finalRows);
                 return;
             }
 
@@ -226,7 +266,16 @@ export function readLeaderboardRowsFromWebfront(plugin, cursorFromUtc, done) {
                 }
 
                 if (rawRows.length === 0) {
-                    done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+                    const finalRows = Object.keys(byIdentity).map((k) => byIdentity[k]);
+                    const sample = finalRows.length > 0 ? JSON.stringify(finalRows[0]).substring(0, 700) : '{}';
+                    const coverage = summarizeFieldCoverage(finalRows);
+                    plugin.logger.logInformation('{Name}: Webfront returned empty page at offset {Offset}. Returning {Rows} rows. Coverage={Coverage} Sample={Sample}',
+                        plugin.name,
+                        offset,
+                        finalRows.length,
+                        JSON.stringify(coverage),
+                        sample);
+                    done(null, finalRows);
                     return;
                 }
 
@@ -245,7 +294,18 @@ export function readLeaderboardRowsFromWebfront(plugin, cursorFromUtc, done) {
                     if (skippedMissingNetwork > 0) {
                         plugin.logger.logWarning('{Name}: Webfront rows skipped due to missing network id: {Count}', plugin.name, skippedMissingNetwork);
                     }
-                    done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+                    const finalRows = Object.keys(byIdentity).map((k) => byIdentity[k]);
+                    const sample = finalRows.length > 0 ? JSON.stringify(finalRows[0]).substring(0, 700) : '{}';
+                    const coverage = summarizeFieldCoverage(finalRows);
+                    plugin.logger.logInformation(
+                        '{Name}: Webfront sync read {Rows} unique player rows across {Pages} page(s). Coverage={Coverage} Sample={Sample}',
+                        plugin.name,
+                        finalRows.length,
+                        page + 1,
+                        JSON.stringify(coverage),
+                        sample
+                    );
+                    done(null, finalRows);
                     return;
                 }
 

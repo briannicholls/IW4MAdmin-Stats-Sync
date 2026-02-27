@@ -1,5 +1,4 @@
 import { chunkRows, maxSourceUpdatedAt, generateUUID } from './utils.js';
-import { readLeaderboardRows } from './db.js';
 import { readLeaderboardRowsFromWebfront } from './webfront.js';
 import { postPayload } from './api.js';
 
@@ -96,16 +95,13 @@ function runSync(plugin, trigger, done) {
 }
 
 function readRows(plugin, cursorFrom, done) {
-    if ((plugin.config.statsSource || 'webfront') === 'db') {
-        const rows = readLeaderboardRows(
-            plugin.config.dbPath, cursorFrom, plugin.runtime.liveNameByNetworkId,
-            plugin.logger, plugin.debugState, plugin.name
-        );
-        done(null, rows);
-        return;
-    }
-
-    readLeaderboardRowsFromWebfront(plugin, cursorFrom, done);
+    readLeaderboardRowsFromWebfront(plugin, cursorFrom, (webfrontError, rows) => {
+        if (!webfrontError) {
+            done(null, rows);
+            return;
+        }
+        done(webfrontError, []);
+    });
 }
 
 function sendBatchSequence(plugin, chunks, index, meta, onComplete, onFailure) {

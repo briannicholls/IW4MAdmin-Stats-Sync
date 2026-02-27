@@ -111,9 +111,6 @@ var _b = (() => {
     if (!normalized || normalized === "0") return "";
     return normalized;
   }
-  function escapeSqlLiteral(value) {
-    return String(value == null ? "" : value).replace(/'/g, "''");
-  }
   function snippet(text) {
     const s = text == null ? "" : String(text);
     return s.length > 220 ? s.substring(0, 220) : s;
@@ -132,20 +129,6 @@ var _b = (() => {
     } catch (_) {
     }
     return (server.listenAddress || server.id || "unknown").toString();
-  }
-  function dbValueToString(value, dbNull) {
-    if (value == null || value === dbNull) return "";
-    return String(value);
-  }
-  function dbValueToInt(value, dbNull) {
-    if (value == null || value === dbNull) return 0;
-    const parsed = parseInt(String(value), 10);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  function dbValueToFloat(value, dbNull) {
-    if (value == null || value === dbNull) return 0;
-    const parsed = parseFloat(String(value));
-    return Number.isFinite(parsed) ? Number(parsed.toFixed(4)) : 0;
   }
   function computeStatHash(networkId, gameName, sourceUpdatedAt, kills, deaths, timePlayed) {
     const parts = [
@@ -204,138 +187,6 @@ var _b = (() => {
       command: body.substring(0, firstSpace),
       args: body.substring(firstSpace + 1).trim()
     };
-  }
-
-  // src/db.js
-  function tryCreateConnection(providerName, className, connectionString) {
-    try {
-      const provider = importNamespace(providerName);
-      if (!provider || typeof provider[className] !== "function") {
-        return null;
-      }
-      return new provider[className](connectionString);
-    } catch (_) {
-      return null;
-    }
-  }
-  function createSqliteConnection(dbPath) {
-    const systemConnection = tryCreateConnection(
-      "System.Data.SQLite",
-      "SQLiteConnection",
-      "Data Source=" + dbPath + ";Read Only=True;"
-    );
-    if (systemConnection) {
-      return systemConnection;
-    }
-    const microsoftConnection = tryCreateConnection(
-      "Microsoft.Data.Sqlite",
-      "SqliteConnection",
-      "Data Source=" + dbPath + ";Mode=ReadOnly;"
-    );
-    if (microsoftConnection) {
-      return microsoftConnection;
-    }
-    throw new Error("No supported SQLite provider found (System.Data.SQLite or Microsoft.Data.Sqlite).");
-  }
-  function buildLeaderboardQuery(cursorFromUtc) {
-    let whereClause = "WHERE c.Active = 1 AND c.NetworkId IS NOT NULL AND c.NetworkId != 0";
-    if (cursorFromUtc) {
-      whereClause += " AND COALESCE(s.UpdatedAt, c.LastConnection, c.FirstConnection) > '" + escapeSqlLiteral(cursorFromUtc) + "'";
-    }
-    return [
-      "SELECT",
-      "  c.NetworkId AS NetworkId,",
-      "  c.GameName AS GameName,",
-      '  COALESCE(a.Name, "") AS AliasName,',
-      '  COALESCE(a.SearchableName, "") AS SearchableName,',
-      "  SUM(s.Kills) AS Kills,",
-      "  SUM(s.Deaths) AS Deaths,",
-      "  SUM(s.TimePlayed) AS TimePlayed,",
-      "  AVG(s.SPM) AS SPM,",
-      "  AVG(s.Skill) AS Skill,",
-      "  AVG(s.ZScore) AS ZScore,",
-      "  AVG(s.EloRating) AS EloRating,",
-      "  AVG(s.RollingWeightedKDR) AS RollingWeightedKDR,",
-      "  MAX(c.Connections) AS Connections,",
-      "  MAX(c.TotalConnectionTime) AS TotalConnectionTime,",
-      "  MAX(c.LastConnection) AS LastConnection,",
-      "  MAX(COALESCE(s.UpdatedAt, c.LastConnection, c.FirstConnection)) AS SourceUpdatedAt",
-      "FROM EFClientStatistics s",
-      "INNER JOIN EFClients c ON c.ClientId = s.ClientId",
-      "LEFT JOIN EFAlias a ON a.AliasId = c.CurrentAliasId",
-      whereClause,
-      "GROUP BY c.NetworkId, c.GameName, a.Name, a.SearchableName",
-      "ORDER BY SourceUpdatedAt ASC, c.NetworkId ASC"
-    ].join(" ");
-  }
-  function readLeaderboardRows(dbPath, cursorFromUtc, liveNameByNetworkId, logger, debugState, pluginName) {
-    const dbNull = System.DBNull.Value;
-    const rows = [];
-    let connection = null;
-    let reader = null;
-    const sql = buildLeaderboardQuery(cursorFromUtc);
-    try {
-      connection = createSqliteConnection(dbPath);
-      connection.Open();
-      const command = connection.CreateCommand();
-      command.CommandText = sql;
-      reader = command.ExecuteReader();
-      while (reader.Read()) {
-        const networkId = dbValueToString(reader["NetworkId"], dbNull);
-        if (!networkId) continue;
-        const sourceUpdatedAt = dbValueToString(reader["SourceUpdatedAt"], dbNull);
-        const liveName = liveNameByNetworkId[networkId] || "";
-        const aliasName = dbValueToString(reader["AliasName"], dbNull);
-        const displayName = cleanName(liveName || aliasName || "client_" + networkId);
-        rows.push({
-          network_id: networkId,
-          game_name: dbValueToString(reader["GameName"], dbNull),
-          display_name: displayName,
-          searchable_name: dbValueToString(reader["SearchableName"], dbNull),
-          total_kills: dbValueToInt(reader["Kills"], dbNull),
-          total_deaths: dbValueToInt(reader["Deaths"], dbNull),
-          total_time_played_seconds: dbValueToInt(reader["TimePlayed"], dbNull),
-          average_spm: dbValueToFloat(reader["SPM"], dbNull),
-          average_skill: dbValueToFloat(reader["Skill"], dbNull),
-          average_zscore: dbValueToFloat(reader["ZScore"], dbNull),
-          average_elo_rating: dbValueToFloat(reader["EloRating"], dbNull),
-          average_rolling_weighted_kdr: dbValueToFloat(reader["RollingWeightedKDR"], dbNull),
-          total_connections: dbValueToInt(reader["Connections"], dbNull),
-          total_connection_time_seconds: dbValueToInt(reader["TotalConnectionTime"], dbNull),
-          last_connection_utc: dbValueToString(reader["LastConnection"], dbNull),
-          source_updated_at_utc: sourceUpdatedAt,
-          stat_hash: computeStatHash(
-            networkId,
-            dbValueToString(reader["GameName"], dbNull),
-            sourceUpdatedAt,
-            dbValueToInt(reader["Kills"], dbNull),
-            dbValueToInt(reader["Deaths"], dbNull),
-            dbValueToInt(reader["TimePlayed"], dbNull)
-          )
-        });
-      }
-    } catch (error) {
-      debugState.lastStatus = "db_error";
-      debugState.lastError = error && error.message ? error.message : "unknown db error";
-      debugState.totalFailures += 1;
-      logger.logError(
-        "{Name}: Failed to read SQLite data from {Db} - {Error}",
-        pluginName,
-        dbPath,
-        debugState.lastError
-      );
-      return [];
-    } finally {
-      try {
-        if (reader) reader.Close();
-      } catch (_) {
-      }
-      try {
-        if (connection) connection.Close();
-      } catch (_) {
-      }
-    }
-    return rows;
   }
 
   // src/api.js
@@ -629,6 +480,34 @@ var _b = (() => {
       stat_hash: computeStatHash(networkId, gameName, sourceUpdatedAt, kills, deaths, timePlayed)
     };
   }
+  function summarizeFieldCoverage(rows) {
+    const coverage = {
+      with_kills: 0,
+      with_deaths: 0,
+      with_time_played: 0,
+      with_spm: 0,
+      with_skill: 0,
+      with_zscore: 0,
+      with_elo: 0,
+      with_rw_kdr: 0,
+      with_connections: 0,
+      with_source_updated_at: 0
+    };
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i] || {};
+      if (Number(row.total_kills || 0) > 0) coverage.with_kills += 1;
+      if (Number(row.total_deaths || 0) > 0) coverage.with_deaths += 1;
+      if (Number(row.total_time_played_seconds || 0) > 0) coverage.with_time_played += 1;
+      if (Number(row.average_spm || 0) > 0) coverage.with_spm += 1;
+      if (Number(row.average_skill || 0) > 0) coverage.with_skill += 1;
+      if (Number(row.average_zscore || 0) !== 0) coverage.with_zscore += 1;
+      if (Number(row.average_elo_rating || 0) > 0) coverage.with_elo += 1;
+      if (Number(row.average_rolling_weighted_kdr || 0) > 0) coverage.with_rw_kdr += 1;
+      if (Number(row.total_connections || 0) > 0) coverage.with_connections += 1;
+      if (String(row.source_updated_at_utc || "").trim() !== "") coverage.with_source_updated_at += 1;
+    }
+    return coverage;
+  }
   function shouldIncludeByCursor(row, cursorFromUtc) {
     if (!cursorFromUtc) return true;
     const sourceUpdatedAt = row && row.source_updated_at_utc ? String(row.source_updated_at_utc) : "";
@@ -686,7 +565,18 @@ var _b = (() => {
       let page = 0;
       const next = () => {
         if (page >= maxPages) {
-          done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+          const finalRows = Object.keys(byIdentity).map((k) => byIdentity[k]);
+          const sample = finalRows.length > 0 ? JSON.stringify(finalRows[0]).substring(0, 700) : "{}";
+          const coverage = summarizeFieldCoverage(finalRows);
+          plugin2.logger.logWarning(
+            "{Name}: Reached webfrontMaxPages={MaxPages}. Returning {Rows} rows. Coverage={Coverage} Sample={Sample}",
+            plugin2.name,
+            maxPages,
+            finalRows.length,
+            JSON.stringify(coverage),
+            sample
+          );
+          done(null, finalRows);
           return;
         }
         const offset = page * pageSize;
@@ -703,7 +593,18 @@ var _b = (() => {
             }
           }
           if (rawRows.length === 0) {
-            done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+            const finalRows = Object.keys(byIdentity).map((k) => byIdentity[k]);
+            const sample = finalRows.length > 0 ? JSON.stringify(finalRows[0]).substring(0, 700) : "{}";
+            const coverage = summarizeFieldCoverage(finalRows);
+            plugin2.logger.logInformation(
+              "{Name}: Webfront returned empty page at offset {Offset}. Returning {Rows} rows. Coverage={Coverage} Sample={Sample}",
+              plugin2.name,
+              offset,
+              finalRows.length,
+              JSON.stringify(coverage),
+              sample
+            );
+            done(null, finalRows);
             return;
           }
           for (let i = 0; i < rawRows.length; i++) {
@@ -720,7 +621,18 @@ var _b = (() => {
             if (skippedMissingNetwork > 0) {
               plugin2.logger.logWarning("{Name}: Webfront rows skipped due to missing network id: {Count}", plugin2.name, skippedMissingNetwork);
             }
-            done(null, Object.keys(byIdentity).map((k) => byIdentity[k]));
+            const finalRows = Object.keys(byIdentity).map((k) => byIdentity[k]);
+            const sample = finalRows.length > 0 ? JSON.stringify(finalRows[0]).substring(0, 700) : "{}";
+            const coverage = summarizeFieldCoverage(finalRows);
+            plugin2.logger.logInformation(
+              "{Name}: Webfront sync read {Rows} unique player rows across {Pages} page(s). Coverage={Coverage} Sample={Sample}",
+              plugin2.name,
+              finalRows.length,
+              page + 1,
+              JSON.stringify(coverage),
+              sample
+            );
+            done(null, finalRows);
             return;
           }
           page += 1;
@@ -817,19 +729,13 @@ var _b = (() => {
     });
   }
   function readRows(plugin2, cursorFrom, done) {
-    if ((plugin2.config.statsSource || "webfront") === "db") {
-      const rows = readLeaderboardRows(
-        plugin2.config.dbPath,
-        cursorFrom,
-        plugin2.runtime.liveNameByNetworkId,
-        plugin2.logger,
-        plugin2.debugState,
-        plugin2.name
-      );
-      done(null, rows);
-      return;
-    }
-    readLeaderboardRowsFromWebfront(plugin2, cursorFrom, done);
+    readLeaderboardRowsFromWebfront(plugin2, cursorFrom, (webfrontError, rows) => {
+      if (!webfrontError) {
+        done(null, rows);
+        return;
+      }
+      done(webfrontError, []);
+    });
   }
   function sendBatchSequence(plugin2, chunks, index, meta, onComplete, onFailure) {
     if (index >= chunks.length) {
