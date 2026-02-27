@@ -1,6 +1,6 @@
 # Match Stats API - IW4MAdmin Plugin
 
-JavaScript plugin for [IW4MAdmin](https://github.com/RaidMax/IW4M-Admin) that exports **sanitized leaderboard snapshots** from IW4MAdmin's SQLite database.
+JavaScript plugin for [IW4MAdmin](https://github.com/RaidMax/IW4M-Admin) that exports **sanitized leaderboard snapshots** using IW4M Webfront API.
 
 This plugin no longer sends raw per-match kill-event payloads. It now sends curated cumulative player totals suitable for a global leaderboard.
 
@@ -9,7 +9,7 @@ It can also post Discord population alerts and (optionally) accept admin command
 ## What It Does
 
 - Triggers sync at match end (`MatchEnded`).
-- Reads cumulative stats from SQLite (`EFClientStatistics`, `EFClients`, `EFAlias`).
+- Reads cumulative stats from IW4M Webfront API (`/api/stats/top`).
 - Sends only changed players using a persisted `updated_at` cursor.
 - Batches payloads for reliability.
 - Uses `ClientEnterMatch` to cache the latest live display names and prefer them over stale aliases.
@@ -82,6 +82,12 @@ Command example config:
 {
   "apiKey": "YOUR_360_API_KEY",
   "apiUrl": "https://api.360-arena.com/iw4m/leaderboard_snapshots",
+  "statsSource": "webfront",
+  "webfrontBaseUrl": "http://127.0.0.1:1624",
+  "webfrontClientId": "",
+  "webfrontPassword": "",
+  "webfrontPageSize": 200,
+  "webfrontMaxPages": 250,
   "dbPath": "C:\\IW4Madmin\\Database\\Database.db",
   "maxRetries": 1,
   "maxRowsPerRequest": 500,
@@ -103,6 +109,12 @@ Command example config:
 |---|---|---|---|
 | `apiKey` | string | *(empty)* | Bearer token sent in `Authorization` header. |
 | `apiUrl` | string | `https://api.360-arena.com/iw4m/leaderboard_snapshots` | Snapshot ingest endpoint. |
+| `statsSource` | string | `webfront` | Reserved for future source modes; current runtime uses Webfront API. |
+| `webfrontBaseUrl` | string | `http://127.0.0.1:1624` | IW4M Webfront base URL. |
+| `webfrontClientId` | string | *(empty)* | Optional client ID for Webfront login. |
+| `webfrontPassword` | string | *(empty)* | Optional password for Webfront login. |
+| `webfrontPageSize` | number | `200` | Rows per `/api/stats/top` page request. |
+| `webfrontMaxPages` | number | `250` | Safety cap for number of pages per sync run. |
 | `dbPath` | string | `C:\IW4Madmin\Database\Database.db` | Absolute SQLite DB file path on the IW4MAdmin host. |
 | `maxRetries` | number | `1` | Retry attempts per failed POST. Total attempts = `1 + maxRetries`. |
 | `maxRowsPerRequest` | number | `500` | Number of player rows per HTTP batch. |
@@ -216,6 +228,7 @@ Your endpoint should:
 ## Troubleshooting
 
 - **No rows sent**: check if `cursor_from_utc` is ahead of source updates; clear cursor in plugin settings if needed.
-- **DB read error**: confirm `dbPath` exists and IW4MAdmin process can read it.
+- **Webfront read error**: confirm `webfrontBaseUrl` is reachable from IW4MAdmin host (usually `http://127.0.0.1:1624`).
+- **DB read error**: not used in current runtime path; Webfront API is the active source.
 - **401/403**: verify `apiKey` and API auth middleware.
 - **Repeated retries**: inspect IW4MAdmin logs for `Match Stats API` entries and API response body snippet.

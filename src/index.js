@@ -56,13 +56,17 @@ const plugin = {
         const stored = this.configWrapper.getValue('config', (newCfg) => {
             if (newCfg) {
                 plugin.config = sanitizeConfig(newCfg);
-                plugin.logger.logInformation('{Name} config reloaded. API={Url} DB={Db}',
-                    plugin.name, plugin.config.apiUrl, plugin.config.dbPath);
+                plugin.logger.logInformation('{Name} config reloaded. API={Url} source={Source}',
+                    plugin.name, plugin.config.apiUrl, plugin.config.statsSource);
             }
         });
 
         if (stored != null) {
             this.config = sanitizeConfig(stored);
+            if (this.shouldPersistSanitizedConfig(stored, this.config)) {
+                this.configWrapper.setValue('config', this.config);
+                this.logger.logInformation('{Name}: Config migrated with new defaults/keys', this.name);
+            }
         } else {
             this.configWrapper.setValue('config', this.config);
         }
@@ -78,12 +82,12 @@ const plugin = {
         }
 
         this.logger.logInformation(
-            '{Name} {Version} by {Author} loaded. API={Url} DB={Db} Cursor={Cursor}',
+            '{Name} {Version} by {Author} loaded. API={Url} source={Source} Cursor={Cursor}',
             this.name,
             this.version,
             this.author,
             this.config.apiUrl,
-            this.config.dbPath,
+            this.config.statsSource,
             this.runtime.lastCursorUtc || '(none)'
         );
 
@@ -159,10 +163,41 @@ const plugin = {
         commandEvent.origin.tell(
             'Match Stats API: ENABLED' +
             ' | Mode: leaderboard snapshot' +
+            ' | Source=' + (this.config.statsSource || 'webfront') +
             ' | Last=' + this.debugState.lastStatus +
             ' | Rows(read/sent)=' + this.debugState.lastRowsRead + '/' + this.debugState.lastRowsSent +
             ' | Cursor=' + (this.runtime.lastCursorUtc || '(none)')
         );
+    },
+
+    shouldPersistSanitizedConfig: function (stored, sanitized) {
+        const source = stored || {};
+        const sourceApiKey = source.apiKey == null ? '' : String(source.apiKey).trim();
+        const sourceApiUrl = source.apiUrl == null ? '' : String(source.apiUrl).trim();
+        const sourceStatsSource = source.statsSource == null ? '' : String(source.statsSource).trim().toLowerCase();
+        const sourceWebfrontBaseUrl = source.webfrontBaseUrl == null ? '' : String(source.webfrontBaseUrl).trim().replace(/\/+$/, '');
+        const sourceWebfrontClientId = source.webfrontClientId == null ? '' : String(source.webfrontClientId).trim();
+        const sourceWebfrontPassword = source.webfrontPassword == null ? '' : String(source.webfrontPassword).trim();
+        const sourceWebfrontPageSize = parseInt(source.webfrontPageSize, 10);
+        const sourceWebfrontMaxPages = parseInt(source.webfrontMaxPages, 10);
+        const sourceDbPath = source.dbPath == null ? '' : String(source.dbPath).trim();
+        const sourceRetries = parseInt(source.maxRetries, 10);
+        const sourceBatchSize = parseInt(source.maxRowsPerRequest, 10);
+        const sourceCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+
+        if (sourceApiKey !== sanitized.apiKey) return true;
+        if (sourceApiUrl !== sanitized.apiUrl) return true;
+        if (sourceStatsSource !== sanitized.statsSource) return true;
+        if (sourceWebfrontBaseUrl !== sanitized.webfrontBaseUrl) return true;
+        if (sourceWebfrontClientId !== sanitized.webfrontClientId) return true;
+        if (sourceWebfrontPassword !== sanitized.webfrontPassword) return true;
+        if (!(Number.isFinite(sourceWebfrontPageSize) && sourceWebfrontPageSize >= 25 && sourceWebfrontPageSize === sanitized.webfrontPageSize)) return true;
+        if (!(Number.isFinite(sourceWebfrontMaxPages) && sourceWebfrontMaxPages >= 1 && sourceWebfrontMaxPages === sanitized.webfrontMaxPages)) return true;
+        if (sourceDbPath !== sanitized.dbPath) return true;
+        if (!(Number.isFinite(sourceRetries) && sourceRetries >= 0 && sourceRetries === sanitized.maxRetries)) return true;
+        if (!(Number.isFinite(sourceBatchSize) && sourceBatchSize > 0 && sourceBatchSize === sanitized.maxRowsPerRequest)) return true;
+        if (!(Number.isFinite(sourceCooldown) && sourceCooldown > 0 && sourceCooldown === sanitized.minSecondsBetweenSyncs)) return true;
+        return false;
     },
 
     toggleDebugFromCommand: function (commandEvent, args) {
