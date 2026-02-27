@@ -1,0 +1,13 @@
+{
+  "name": "iw4madmin-match-stats-api",
+  "version": "2.0.0",
+  "private": true,
+  "description": "IW4MAdmin plugin that syncs leaderboard snapshots to the 360 Arena API",
+  "scripts": {
+    "build": "esbuild src/index.js --bundle --format=iife --global-name=_b --footer:js=\"var init=_b.init;var plugin=_b.plugin;var commands=_b.commands;\" --outfile=dist/MatchStatsAPI.js",
+    "watch": "esbuild src/index.js --bundle --format=iife --global-name=_b --footer:js=\"var init=_b.init;var plugin=_b.plugin;var commands=_b.commands;\" --outfile=dist/MatchStatsAPI.js --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
