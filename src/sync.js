@@ -1,5 +1,5 @@
 import { chunkRows, maxSourceUpdatedAt, generateUUID } from './utils.js';
-import { readLeaderboardRowsFromWebfront } from './webfront.js';
+import { readIngestionRowsFromDatabaseContext } from './db.js';
 import { postPayload } from './api.js';
 
 export function enqueueSync(plugin, trigger) {
@@ -46,7 +46,7 @@ function runSync(plugin, trigger, done) {
             plugin.debugState.totalFailures += 1;
             plugin.logger.logError('{Name}: Failed to read leaderboard data from {Source} - {Error}',
                 plugin.name,
-                plugin.config.statsSource || 'webfront',
+                'db_context',
                 plugin.debugState.lastError);
             done();
             return;
@@ -95,12 +95,12 @@ function runSync(plugin, trigger, done) {
 }
 
 function readRows(plugin, cursorFrom, done) {
-    readLeaderboardRowsFromWebfront(plugin, cursorFrom, (webfrontError, rows) => {
-        if (!webfrontError) {
+    readIngestionRowsFromDatabaseContext(plugin, cursorFrom, (dbError, rows) => {
+        if (!dbError) {
             done(null, rows);
             return;
         }
-        done(webfrontError, []);
+        done(dbError, []);
     });
 }
 
@@ -121,7 +121,7 @@ function sendBatchSequence(plugin, chunks, index, meta, onComplete, onFailure) {
         cursor_to_utc: meta.cursorTo,
         triggered_by: meta.trigger,
         captured_at_utc: new Date().toISOString(),
-        players: rows
+        rows: rows
     };
 
     const logDebugBound = plugin.logDebug.bind(plugin);
