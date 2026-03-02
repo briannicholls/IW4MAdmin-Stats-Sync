@@ -1,4 +1,4 @@
-export const DEFAULT_API_URL = 'https://api.360-arena.com/iw4m/leaderboard_snapshots';
+export const DEFAULT_API_URL = 'http://localhost:6969/iw4m/leaderboard_snapshots';
 
 export const defaultConfig = {
     apiKey: '',
@@ -6,6 +6,7 @@ export const defaultConfig = {
     maxRetries: 1,
     maxRowsPerRequest: 500,
     minSecondsBetweenSyncs: 20,
+    snapshotIntervalSeconds: 300,
     discordWebhookUrl: '',
     discordThresholdLow: 6,
     discordThresholdHigh: 10,
@@ -21,6 +22,7 @@ export function sanitizeConfig(cfg) {
     const parsedRetries = parseInt(source.maxRetries, 10);
     const parsedBatchSize = parseInt(source.maxRowsPerRequest, 10);
     const parsedCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+    const parsedSnapshotInterval = parseInt(source.snapshotIntervalSeconds, 10);
     const parsedThresholdLow = parseInt(source.discordThresholdLow, 10);
     const parsedThresholdHigh = parseInt(source.discordThresholdHigh, 10);
     const parsedDiscordPollInterval = parseInt(source.discordPollIntervalSeconds, 10);
@@ -47,6 +49,7 @@ export function sanitizeConfig(cfg) {
         maxRetries: Number.isFinite(parsedRetries) && parsedRetries >= 0 ? parsedRetries : 1,
         maxRowsPerRequest: Number.isFinite(parsedBatchSize) && parsedBatchSize > 0 ? parsedBatchSize : 500,
         minSecondsBetweenSyncs: Number.isFinite(parsedCooldown) && parsedCooldown > 0 ? parsedCooldown : 20,
+        snapshotIntervalSeconds: Number.isFinite(parsedSnapshotInterval) && parsedSnapshotInterval >= 5 ? parsedSnapshotInterval : 300,
         discordWebhookUrl: discordWebhookUrl,
         discordThresholdLow: thresholdLow,
         discordThresholdHigh: thresholdHigh,

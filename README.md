@@ -30,10 +30,11 @@ Plugin settings are stored under your script plugin entry key in the `config` ob
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `apiKey` | string | *(empty)* | Bearer token sent in `Authorization` header. |
-| `apiUrl` | string | `https://api.360-arena.com/iw4m/leaderboard_snapshots` | Ingest endpoint. |
+| `apiUrl` | string | `http://localhost:6969/iw4m/leaderboard_snapshots` | Ingest endpoint. |
 | `maxRetries` | number | `1` | Retry attempts per failed POST. Total attempts = `1 + maxRetries`. |
 | `maxRowsPerRequest` | number | `500` | Number of DB rows per HTTP batch. |
 | `minSecondsBetweenSyncs` | number | `20` | Per-server cooldown to ignore duplicate `MatchEnded` triggers. |
+| `snapshotIntervalSeconds` | number | `300` | Periodic snapshot sync interval. Minimum `5` seconds. |
 | `discordWebhookUrl` | string | *(empty)* | Discord Incoming Webhook URL for population alerts. |
 | `discordThresholdLow` | number | `6` | First alert threshold; sends alert when player count rises above this value. |
 | `discordThresholdHigh` | number | `10` | Second alert threshold; sends alert when player count rises above this value. |
@@ -48,10 +49,11 @@ Example:
 ```json
 {
   "apiKey": "YOUR_360_API_KEY",
-  "apiUrl": "https://api.360-arena.com/iw4m/leaderboard_snapshots",
+  "apiUrl": "http://localhost:6969/iw4m/leaderboard_snapshots",
   "maxRetries": 1,
   "maxRowsPerRequest": 500,
   "minSecondsBetweenSyncs": 20,
+  "snapshotIntervalSeconds": 300,
   "discordWebhookUrl": "https://discord.com/api/webhooks/...",
   "discordThresholdLow": 6,
   "discordThresholdHigh": 10,
@@ -65,7 +67,7 @@ Example:
 
 ## Triggering
 
-Sync runs on each match end signal. If a sync is already running, one follow-up sync is queued.
+Sync runs on each match end signal and on a periodic interval (`snapshotIntervalSeconds`). If a sync is already running, one follow-up sync is queued.
 
 The plugin uses a `source_updated_at_utc` cursor so duplicate triggers do not re-send old rows.
 
@@ -158,3 +160,6 @@ Your endpoint should:
 - **DB context read error**: verify IW4M version supports script access to `IDatabaseContextFactory` and check IW4M logs for plugin startup errors.
 - **401/403**: verify `apiKey` and API auth middleware.
 - **Repeated retries**: inspect IW4M logs for `Match Stats API` entries and API response snippets.
+
+## Development
+

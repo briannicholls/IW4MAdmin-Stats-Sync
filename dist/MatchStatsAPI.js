@@ -26,13 +26,14 @@ var _b = (() => {
   });
 
   // src/config.js
-  var DEFAULT_API_URL = "https://api.360-arena.com/iw4m/leaderboard_snapshots";
+  var DEFAULT_API_URL = "http://localhost:6969/iw4m/leaderboard_snapshots";
   var defaultConfig = {
     apiKey: "",
     apiUrl: DEFAULT_API_URL,
     maxRetries: 1,
     maxRowsPerRequest: 500,
     minSecondsBetweenSyncs: 20,
+    snapshotIntervalSeconds: 300,
     discordWebhookUrl: "",
     discordThresholdLow: 6,
     discordThresholdHigh: 10,
@@ -47,6 +48,7 @@ var _b = (() => {
     const parsedRetries = parseInt(source.maxRetries, 10);
     const parsedBatchSize = parseInt(source.maxRowsPerRequest, 10);
     const parsedCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+    const parsedSnapshotInterval = parseInt(source.snapshotIntervalSeconds, 10);
     const parsedThresholdLow = parseInt(source.discordThresholdLow, 10);
     const parsedThresholdHigh = parseInt(source.discordThresholdHigh, 10);
     const parsedDiscordPollInterval = parseInt(source.discordPollIntervalSeconds, 10);
@@ -66,6 +68,7 @@ var _b = (() => {
       maxRetries: Number.isFinite(parsedRetries) && parsedRetries >= 0 ? parsedRetries : 1,
       maxRowsPerRequest: Number.isFinite(parsedBatchSize) && parsedBatchSize > 0 ? parsedBatchSize : 500,
       minSecondsBetweenSyncs: Number.isFinite(parsedCooldown) && parsedCooldown > 0 ? parsedCooldown : 20,
+      snapshotIntervalSeconds: Number.isFinite(parsedSnapshotInterval) && parsedSnapshotInterval >= 5 ? parsedSnapshotInterval : 300,
       discordWebhookUrl,
       discordThresholdLow: thresholdLow,
       discordThresholdHigh: thresholdHigh,
@@ -1013,6 +1016,8 @@ var _b = (() => {
       isSyncInFlight: false,
       queuedSync: false,
       lastTriggerAtMsByServer: {},
+      lastIntervalSyncAtMs: 0,
+      intervalTimerHandle: null,
       lastCursorUtc: null,
       recentBatchId: null,
       liveNameByNetworkId: {},
@@ -1049,6 +1054,7 @@ var _b = (() => {
             plugin.name,
             plugin.config.apiUrl
           );
+          plugin.configureIntervalSync();
         }
       });
       if (stored != null) {
@@ -1079,6 +1085,7 @@ var _b = (() => {
       if (!this.config.apiKey) {
         this.logger.logWarning("{Name}: apiKey is empty. The API will likely reject requests with 401.", this.name);
       }
+      this.configureIntervalSync();
     },
     onClientEnterMatch: function(enterEvent, _token) {
       const client = extractClientFromEvent(enterEvent);
@@ -1091,6 +1098,7 @@ var _b = (() => {
       this.logDebug("{Name}: Live name cached net={Net} name={Player}", this.name, networkId, liveName);
       trackServerPopulation(this, enterEvent);
       pollDiscordCommands(this, enterEvent && enterEvent.server ? enterEvent.server : null);
+      this.maybeRunIntervalSync(enterEvent && enterEvent.server ? enterEvent.server : null);
     },
     onMatchEnded: function(matchEndEvent, _token) {
       const server = matchEndEvent ? matchEndEvent.server : null;
@@ -1129,6 +1137,7 @@ var _b = (() => {
       if (command === "msd" || command === "msdebug") {
         this.toggleDebugFromCommand(commandEvent, parsed.args);
       }
+      this.maybeRunIntervalSync(commandEvent && commandEvent.server ? commandEvent.server : null);
     },
     tellStatus: function(commandEvent) {
       commandEvent.origin.tell(
@@ -1142,12 +1151,52 @@ var _b = (() => {
       const sourceRetries = parseInt(source.maxRetries, 10);
       const sourceBatchSize = parseInt(source.maxRowsPerRequest, 10);
       const sourceCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+      const sourceSnapshotInterval = parseInt(source.snapshotIntervalSeconds, 10);
       if (sourceApiKey !== sanitized.apiKey) return true;
       if (sourceApiUrl !== sanitized.apiUrl) return true;
       if (!(Number.isFinite(sourceRetries) && sourceRetries >= 0 && sourceRetries === sanitized.maxRetries)) return true;
       if (!(Number.isFinite(sourceBatchSize) && sourceBatchSize > 0 && sourceBatchSize === sanitized.maxRowsPerRequest)) return true;
       if (!(Number.isFinite(sourceCooldown) && sourceCooldown > 0 && sourceCooldown === sanitized.minSecondsBetweenSyncs)) return true;
+      if (!(Number.isFinite(sourceSnapshotInterval) && sourceSnapshotInterval >= 5 && sourceSnapshotInterval === sanitized.snapshotIntervalSeconds)) return true;
       return false;
+    },
+    configureIntervalSync: function() {
+      const seconds = Math.max(5, parseInt(this.config.snapshotIntervalSeconds, 10) || 300);
+      if (this.runtime.intervalTimerHandle && typeof clearInterval === "function") {
+        clearInterval(this.runtime.intervalTimerHandle);
+        this.runtime.intervalTimerHandle = null;
+      }
+      if (typeof setInterval !== "function") {
+        this.logger.logWarning("{Name}: setInterval is unavailable in script runtime; interval sync will run on activity events.", this.name);
+        return;
+      }
+      this.runtime.intervalTimerHandle = setInterval(() => {
+        this.maybeRunIntervalSync(null);
+      }, seconds * 1e3);
+      this.logger.logInformation("{Name}: Interval snapshot sync enabled every {Seconds}s", this.name, seconds);
+    },
+    buildTrigger: function(eventName, server) {
+      return {
+        event: eventName,
+        occurred_at_utc: (/* @__PURE__ */ new Date()).toISOString(),
+        server_id: server ? server.toString() : "unknown",
+        server_name: server && (server.serverName || server.hostname) ? server.serverName || server.hostname : "",
+        map_name: server && server.currentMap ? server.currentMap.name || "" : "",
+        game: server && server.gameName ? server.gameName.toString() : "",
+        game_type: server && server.gameType ? server.gameType.toString() : ""
+      };
+    },
+    maybeRunIntervalSync: function(hintServer) {
+      const seconds = Math.max(5, parseInt(this.config.snapshotIntervalSeconds, 10) || 300);
+      const nowMs = Date.now();
+      const elapsedMs = nowMs - (this.runtime.lastIntervalSyncAtMs || 0);
+      if (elapsedMs < seconds * 1e3) {
+        return;
+      }
+      const server = hintServer || this.runtime.serverByKey[this.runtime.lastActiveServerKey] || null;
+      this.runtime.lastIntervalSyncAtMs = nowMs;
+      this.logger.logInformation("{Name}: Interval trigger fired; starting leaderboard sync", this.name);
+      enqueueSync(this, this.buildTrigger("interval", server));
     },
     toggleDebugFromCommand: function(commandEvent, args) {
       const arg = String(args || "").trim().toLowerCase();
@@ -1181,6 +1230,7 @@ var _b = (() => {
         (disconnectEvent, _token) => {
           trackServerPopulation(plugin, disconnectEvent, true);
           pollDiscordCommands(plugin, disconnectEvent && disconnectEvent.server ? disconnectEvent.server : null);
+          plugin.maybeRunIntervalSync(disconnectEvent && disconnectEvent.server ? disconnectEvent.server : null);
         }
       );
     } catch (_err) {
