@@ -2,10 +2,10 @@ export const DEFAULT_API_URL = 'http://localhost:6969/iw4m/leaderboard_snapshots
 
 export const defaultConfig = {
     apiKey: '',
-    apiUrl: DEFAULT_API_URL,
     maxRetries: 1,
     maxRowsPerRequest: 500,
     minSecondsBetweenSyncs: 20,
+    postMatchSyncDelaySeconds: 10,
     snapshotIntervalSeconds: 300,
     discordWebhookUrl: '',
     discordThresholdLow: 6,
@@ -22,15 +22,13 @@ export function sanitizeConfig(cfg) {
     const parsedRetries = parseInt(source.maxRetries, 10);
     const parsedBatchSize = parseInt(source.maxRowsPerRequest, 10);
     const parsedCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+    const parsedPostMatchDelay = parseInt(source.postMatchSyncDelaySeconds, 10);
     const parsedSnapshotInterval = parseInt(source.snapshotIntervalSeconds, 10);
     const parsedThresholdLow = parseInt(source.discordThresholdLow, 10);
     const parsedThresholdHigh = parseInt(source.discordThresholdHigh, 10);
     const parsedDiscordPollInterval = parseInt(source.discordPollIntervalSeconds, 10);
 
     const apiKey = source.apiKey == null ? '' : String(source.apiKey).trim();
-    const apiUrl = source.apiUrl == null || String(source.apiUrl).trim() === ''
-        ? DEFAULT_API_URL
-        : String(source.apiUrl).trim();
     const discordWebhookUrl = source.discordWebhookUrl == null ? '' : String(source.discordWebhookUrl).trim();
     const discordBotToken = source.discordBotToken == null ? '' : String(source.discordBotToken).trim();
     const discordChannelId = source.discordChannelId == null ? '' : String(source.discordChannelId).trim();
@@ -45,10 +43,10 @@ export function sanitizeConfig(cfg) {
 
     return {
         apiKey: apiKey,
-        apiUrl: apiUrl,
         maxRetries: Number.isFinite(parsedRetries) && parsedRetries >= 0 ? parsedRetries : 1,
         maxRowsPerRequest: Number.isFinite(parsedBatchSize) && parsedBatchSize > 0 ? parsedBatchSize : 500,
         minSecondsBetweenSyncs: Number.isFinite(parsedCooldown) && parsedCooldown > 0 ? parsedCooldown : 20,
+        postMatchSyncDelaySeconds: Number.isFinite(parsedPostMatchDelay) && parsedPostMatchDelay >= 0 ? parsedPostMatchDelay : 10,
         snapshotIntervalSeconds: Number.isFinite(parsedSnapshotInterval) && parsedSnapshotInterval >= 5 ? parsedSnapshotInterval : 300,
         discordWebhookUrl: discordWebhookUrl,
         discordThresholdLow: thresholdLow,

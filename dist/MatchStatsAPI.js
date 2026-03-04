@@ -29,10 +29,10 @@ var _b = (() => {
   var DEFAULT_API_URL = "http://localhost:6969/iw4m/leaderboard_snapshots";
   var defaultConfig = {
     apiKey: "",
-    apiUrl: DEFAULT_API_URL,
     maxRetries: 1,
     maxRowsPerRequest: 500,
     minSecondsBetweenSyncs: 20,
+    postMatchSyncDelaySeconds: 10,
     snapshotIntervalSeconds: 300,
     discordWebhookUrl: "",
     discordThresholdLow: 6,
@@ -48,12 +48,12 @@ var _b = (() => {
     const parsedRetries = parseInt(source.maxRetries, 10);
     const parsedBatchSize = parseInt(source.maxRowsPerRequest, 10);
     const parsedCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+    const parsedPostMatchDelay = parseInt(source.postMatchSyncDelaySeconds, 10);
     const parsedSnapshotInterval = parseInt(source.snapshotIntervalSeconds, 10);
     const parsedThresholdLow = parseInt(source.discordThresholdLow, 10);
     const parsedThresholdHigh = parseInt(source.discordThresholdHigh, 10);
     const parsedDiscordPollInterval = parseInt(source.discordPollIntervalSeconds, 10);
     const apiKey = source.apiKey == null ? "" : String(source.apiKey).trim();
-    const apiUrl = source.apiUrl == null || String(source.apiUrl).trim() === "" ? DEFAULT_API_URL : String(source.apiUrl).trim();
     const discordWebhookUrl = source.discordWebhookUrl == null ? "" : String(source.discordWebhookUrl).trim();
     const discordBotToken = source.discordBotToken == null ? "" : String(source.discordBotToken).trim();
     const discordChannelId = source.discordChannelId == null ? "" : String(source.discordChannelId).trim();
@@ -64,10 +64,10 @@ var _b = (() => {
     const thresholdHigh = thresholdHighRaw > thresholdLow ? thresholdHighRaw : thresholdLow + 1;
     return {
       apiKey,
-      apiUrl,
       maxRetries: Number.isFinite(parsedRetries) && parsedRetries >= 0 ? parsedRetries : 1,
       maxRowsPerRequest: Number.isFinite(parsedBatchSize) && parsedBatchSize > 0 ? parsedBatchSize : 500,
       minSecondsBetweenSyncs: Number.isFinite(parsedCooldown) && parsedCooldown > 0 ? parsedCooldown : 20,
+      postMatchSyncDelaySeconds: Number.isFinite(parsedPostMatchDelay) && parsedPostMatchDelay >= 0 ? parsedPostMatchDelay : 10,
       snapshotIntervalSeconds: Number.isFinite(parsedSnapshotInterval) && parsedSnapshotInterval >= 5 ? parsedSnapshotInterval : 300,
       discordWebhookUrl,
       discordThresholdLow: thresholdLow,
@@ -90,9 +90,6 @@ var _b = (() => {
     if (!normalized || normalized === "0") return "";
     return normalized;
   }
-  function escapeSqlLiteral(value) {
-    return String(value == null ? "" : value).replace(/'/g, "''");
-  }
   function snippet(text) {
     const s = text == null ? "" : String(text);
     return s.length > 220 ? s.substring(0, 220) : s;
@@ -111,20 +108,6 @@ var _b = (() => {
     } catch (_) {
     }
     return (server.listenAddress || server.id || "unknown").toString();
-  }
-  function dbValueToString(value, dbNull) {
-    if (value == null || value === dbNull) return "";
-    return String(value);
-  }
-  function dbValueToInt(value, dbNull) {
-    if (value == null || value === dbNull) return 0;
-    const parsed = parseInt(String(value), 10);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  function dbValueToFloat(value, dbNull) {
-    if (value == null || value === dbNull) return 0;
-    const parsed = parseFloat(String(value));
-    return Number.isFinite(parsed) ? Number(parsed.toFixed(4)) : 0;
   }
   function computeStatHash(networkId, gameName, sourceUpdatedAt, kills, deaths, timePlayed) {
     const parts = [
@@ -186,106 +169,321 @@ var _b = (() => {
   }
 
   // src/db.js
-  function buildIngestionQuery(cursorFromUtc) {
-    let whereClause = "WHERE c.Active = 1 AND c.NetworkId IS NOT NULL AND c.NetworkId != 0";
-    if (cursorFromUtc) {
-      whereClause += " AND COALESCE(s.UpdatedAt, c.LastConnection, c.FirstConnection) > '" + escapeSqlLiteral(cursorFromUtc) + "'";
+  function valueFromAny(source, names, fallback) {
+    if (!source) return fallback;
+    for (let i = 0; i < names.length; i++) {
+      const key = names[i];
+      if (source[key] !== void 0 && source[key] !== null) return source[key];
     }
-    return [
-      "SELECT",
-      "  c.ClientId AS ClientId,",
-      "  c.NetworkId AS NetworkId,",
-      "  c.GameName AS GameName,",
-      '  COALESCE(a.Name, "") AS AliasName,',
-      '  COALESCE(a.SearchableName, "") AS SearchableName,',
-      "  SUM(s.Kills) AS Kills,",
-      "  SUM(s.Deaths) AS Deaths,",
-      "  SUM(s.TimePlayed) AS TimePlayed,",
-      "  AVG(s.SPM) AS SPM,",
-      "  AVG(s.Skill) AS Skill,",
-      "  AVG(s.ZScore) AS ZScore,",
-      "  AVG(s.EloRating) AS EloRating,",
-      "  AVG(s.RollingWeightedKDR) AS RollingWeightedKDR,",
-      "  MAX(c.Connections) AS Connections,",
-      "  MAX(c.TotalConnectionTime) AS TotalConnectionTime,",
-      "  MAX(c.LastConnection) AS LastConnection,",
-      "  MAX(COALESCE(s.UpdatedAt, c.LastConnection, c.FirstConnection)) AS SourceUpdatedAt",
-      "FROM EFClientStatistics s",
-      "INNER JOIN EFClients c ON c.ClientId = s.ClientId",
-      "LEFT JOIN EFAlias a ON a.AliasId = c.CurrentAliasId",
-      whereClause,
-      "GROUP BY c.ClientId, c.NetworkId, c.GameName, a.Name, a.SearchableName",
-      "ORDER BY SourceUpdatedAt ASC, c.ClientId ASC"
-    ].join(" ");
+    return fallback;
   }
-  function readIngestionRowsFromDatabaseContext(plugin2, cursorFromUtc, done) {
+  function valueFromAnyPath(source, paths, fallback) {
+    if (!source) return fallback;
+    for (let i = 0; i < paths.length; i++) {
+      const path = String(paths[i] || "").split(".");
+      let current = source;
+      let found = true;
+      for (let j = 0; j < path.length; j++) {
+        const key = path[j];
+        if (!key || current == null || current[key] === void 0 || current[key] === null) {
+          found = false;
+          break;
+        }
+        current = current[key];
+      }
+      if (found) return current;
+    }
+    return fallback;
+  }
+  function keyList(source, maxCount) {
+    if (!source) return "(none)";
+    const out = [];
+    try {
+      const keys = Object.keys(source);
+      for (let i = 0; i < keys.length; i++) {
+        out.push(String(keys[i]));
+      }
+    } catch (_) {
+    }
+    try {
+      for (const key in source) {
+        out.push(String(key));
+      }
+    } catch (_) {
+    }
+    const uniq = Array.from(new Set(out)).sort();
+    if (uniq.length === 0) return "(none)";
+    const limit = Math.max(5, parseInt(maxCount, 10) || 40);
+    return uniq.slice(0, limit).join(",");
+  }
+  function parseIntSafe(value) {
+    const parsed = parseInt(String(value == null ? "" : value), 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  function parseFloatSafe(value) {
+    const parsed = parseFloat(String(value == null ? "" : value));
+    return Number.isFinite(parsed) ? Number(parsed.toFixed(4)) : 0;
+  }
+  function toArray(source) {
+    if (!source) return [];
+    if (Array.isArray(source)) return source;
+    const out = [];
+    try {
+      const count = parseIntSafe(valueFromAny(source, ["Count", "count", "Length", "length"], 0));
+      if (count > 0) {
+        for (let i = 0; i < count; i++) {
+          if (source[i] !== void 0) out.push(source[i]);
+        }
+        if (out.length > 0) return out;
+      }
+    } catch (_) {
+    }
+    try {
+      for (const item of source) {
+        out.push(item);
+      }
+    } catch (_) {
+    }
+    return out;
+  }
+  function normalizeTimestamp(value) {
+    if (value == null) return "";
+    const raw = String(value).trim();
+    if (!raw) return "";
+    const date = new Date(raw);
+    if (!Number.isNaN(date.getTime())) return date.toISOString();
+    const spaceParsed = new Date(raw.replace(" ", "T"));
+    if (!Number.isNaN(spaceParsed.getTime())) return spaceParsed.toISOString();
+    return raw;
+  }
+  function buildNetworkIdAliases(rawNetworkId) {
+    const raw = String(rawNetworkId == null ? "" : rawNetworkId).trim();
+    if (!raw) return [];
+    const aliases = [raw];
+    const decValue = parseInt(raw, 10);
+    if (Number.isFinite(decValue)) {
+      aliases.push(String(decValue));
+      aliases.push(decValue.toString(16).toUpperCase());
+    }
+    const hexValue = parseInt(raw, 16);
+    if (Number.isFinite(hexValue)) {
+      aliases.push(String(hexValue));
+      aliases.push(hexValue.toString(16).toUpperCase());
+    }
+    return Array.from(new Set(aliases));
+  }
+  function serverFromTrigger(plugin2, trigger) {
+    const runtime = plugin2.runtime || {};
+    if (!trigger || !trigger.server_id) {
+      return runtime.serverByKey ? runtime.serverByKey[runtime.lastActiveServerKey] : null;
+    }
+    if (runtime.serverByKey && runtime.serverByKey[trigger.server_id]) {
+      return runtime.serverByKey[trigger.server_id];
+    }
+    return runtime.serverByKey ? runtime.serverByKey[runtime.lastActiveServerKey] : null;
+  }
+  function extractServerClientIds(server) {
+    const connectedClients = valueFromAny(server, ["connectedClients", "ConnectedClients", "clients", "Clients"], null);
+    const clients = toArray(connectedClients);
+    const ids = [];
+    for (let i = 0; i < clients.length; i++) {
+      const client = clients[i];
+      const id = parseIntSafe(valueFromAny(client, ["ClientId", "clientId"], 0));
+      if (id > 0) ids.push(id);
+    }
+    return Array.from(new Set(ids));
+  }
+  function logServerClientSample(plugin2, server, clients) {
+    if (!plugin2) return;
+    const sample = clients.length > 0 ? clients[0] : null;
+    plugin2.logDebug(
+      "{Name}: server snapshot server={Server} connected_clients={Count} server_keys={ServerKeys} sample_client_keys={ClientKeys} sample_client_id={ClientId} sample_network_id={NetworkId} sample_name={Name}",
+      plugin2.name,
+      String(server ? server.toString ? server.toString() : "" : ""),
+      clients.length,
+      keyList(server, 80),
+      keyList(sample, 80),
+      String(valueFromAny(sample, ["ClientId", "clientId"], "")),
+      String(valueFromAny(sample, ["NetworkId", "networkId"], "")),
+      String(valueFromAny(sample, ["Name", "name", "CleanedName", "cleanedName"], ""))
+    );
+  }
+  function buildBasicDataByClientId(context, clientIds) {
+    const out = {};
+    if (!context || !context.Clients || typeof context.Clients.GetClientsBasicData !== "function") {
+      return out;
+    }
+    const basicsRaw = context.Clients.GetClientsBasicData(clientIds);
+    const basics = toArray(basicsRaw);
+    for (let i = 0; i < basics.length; i++) {
+      const row = basics[i];
+      const clientId = parseIntSafe(valueFromAny(row, ["ClientId", "clientId"], 0));
+      if (clientId > 0) out[clientId] = row;
+    }
+    return out;
+  }
+  function logContextDataSample(plugin2, basics, stats) {
+    if (!plugin2) return;
+    const basic = basics.length > 0 ? basics[0] : null;
+    const stat = stats.length > 0 ? stats[0] : null;
+    plugin2.logDebug(
+      "{Name}: context sample basics_count={BasicsCount} stats_count={StatsCount} basic_keys={BasicKeys} stat_keys={StatKeys} basic_name={BasicName} basic_searchable={BasicSearchable} stat_updated={StatUpdated} stat_game={StatGame}",
+      plugin2.name,
+      basics.length,
+      stats.length,
+      keyList(basic, 100),
+      keyList(stat, 100),
+      String(valueFromAny(basic, ["Name", "name"], "")),
+      String(valueFromAny(basic, ["SearchableName", "searchableName"], "")),
+      String(valueFromAny(stat, ["UpdatedAt", "updatedAt"], "")),
+      String(valueFromAny(stat, ["GameName", "gameName"], ""))
+    );
+  }
+  function statRowsForServer(context, clientIds, server) {
+    if (!context || !context.ClientStatistics || typeof context.ClientStatistics.GetClientsStatData !== "function") {
+      throw new Error("ClientStatistics.GetClientsStatData is unavailable in script runtime.");
+    }
+    const serverDatabaseId = parseIntSafe(valueFromAny(server, ["legacyDatabaseId", "LegacyDatabaseId", "databaseId", "DatabaseId"], 0));
+    if (serverDatabaseId <= 0) {
+      throw new Error("Unable to resolve server legacyDatabaseId for stats query.");
+    }
+    return toArray(context.ClientStatistics.GetClientsStatData(clientIds, serverDatabaseId));
+  }
+  function buildRowFromStat(stat, basic, plugin2, server) {
+    const clientId = parseIntSafe(valueFromAny(stat, ["ClientId", "clientId"], valueFromAny(basic, ["ClientId", "clientId"], 0)));
+    const networkId = String(valueFromAny(stat, ["NetworkId", "networkId"], valueFromAny(basic, ["NetworkId", "networkId"], "")) || "").trim();
+    if (!networkId) return null;
+    const gameName = cleanName(String(valueFromAny(server, ["serverName", "hostname"], "") || ""));
+    const sourceUpdatedAt = normalizeTimestamp(valueFromAny(
+      stat,
+      ["UpdatedAt", "updatedAt", "LastConnection", "lastConnection", "FirstConnection", "firstConnection"],
+      valueFromAny(basic, ["LastConnection", "lastConnection"], "")
+    ));
+    const basicName = String(valueFromAnyPath(
+      basic,
+      ["Name", "name", "AliasName", "aliasName", "Alias.Name", "alias.name", "CurrentAlias.Name", "currentAlias.name"],
+      ""
+    ) || "");
+    const liveNameByClientId = String((plugin2.runtime.liveNameByClientId || {})[String(clientId)] || "");
+    let liveNameByNetworkId = "";
+    const networkAliases = buildNetworkIdAliases(networkId);
+    const networkMap = plugin2.runtime.liveNameByNetworkId || {};
+    for (let i = 0; i < networkAliases.length; i++) {
+      const alias = networkAliases[i];
+      if (networkMap[alias]) {
+        liveNameByNetworkId = String(networkMap[alias]);
+        break;
+      }
+    }
+    const chosenDisplayName = cleanName(liveNameByClientId || liveNameByNetworkId || basicName || "");
+    const searchableNameRaw = String(valueFromAnyPath(
+      basic,
+      ["SearchableName", "searchableName", "Alias.SearchableName", "alias.searchableName", "CurrentAlias.SearchableName", "currentAlias.searchableName"],
+      ""
+    ) || "");
+    const searchableName = cleanName(searchableNameRaw || chosenDisplayName).toLowerCase();
+    const kills = parseIntSafe(valueFromAny(stat, ["Kills", "kills"], 0));
+    const deaths = parseIntSafe(valueFromAny(stat, ["Deaths", "deaths"], 0));
+    const timePlayed = parseIntSafe(valueFromAny(stat, ["TimePlayed", "timePlayed"], 0));
+    return {
+      client_id: clientId,
+      network_id: networkId,
+      game_name: gameName,
+      display_name: chosenDisplayName,
+      searchable_name: searchableName,
+      total_kills: kills,
+      total_deaths: deaths,
+      total_time_played_seconds: timePlayed,
+      average_spm: parseFloatSafe(valueFromAny(stat, ["SPM", "spm"], 0)),
+      average_skill: parseFloatSafe(valueFromAny(stat, ["Skill", "skill"], 0)),
+      average_zscore: parseFloatSafe(valueFromAny(stat, ["ZScore", "zScore"], 0)),
+      average_elo_rating: parseFloatSafe(valueFromAny(stat, ["EloRating", "eloRating"], 0)),
+      average_rolling_weighted_kdr: parseFloatSafe(valueFromAny(stat, ["RollingWeightedKDR", "rollingWeightedKdr", "rollingWeightedKDR"], 0)),
+      total_connections: parseIntSafe(valueFromAny(basic, ["Connections", "connections"], 0)),
+      total_connection_time_seconds: parseIntSafe(valueFromAny(basic, ["TotalConnectionTime", "totalConnectionTime"], 0)),
+      last_connection_utc: normalizeTimestamp(valueFromAny(basic, ["LastConnection", "lastConnection"], "")),
+      source_updated_at_utc: sourceUpdatedAt,
+      stat_hash: computeStatHash(networkId, gameName, sourceUpdatedAt, kills, deaths, timePlayed)
+    };
+  }
+  function readIngestionRowsFromDatabaseContext(plugin2, cursorFromUtc, trigger, done) {
     let context = null;
-    let connection = null;
-    let reader = null;
     try {
       if (!plugin2.dbContextFactory) {
         done(new Error("IDatabaseContextFactory service is unavailable in script runtime."), []);
         return;
       }
-      context = plugin2.dbContextFactory.CreateContext(false);
-      if (!context || !context.Database || typeof context.Database.GetDbConnection !== "function") {
-        done(new Error("Unable to create database context connection from IDatabaseContextFactory."), []);
+      const server = serverFromTrigger(plugin2, trigger);
+      if (!server) {
+        done(new Error("No active server context available for stats ingestion."), []);
         return;
       }
-      connection = context.Database.GetDbConnection();
-      if (!connection) {
-        done(new Error("IDatabaseContextFactory returned a null DbConnection."), []);
+      const connectedClients = toArray(valueFromAny(server, ["connectedClients", "ConnectedClients", "clients", "Clients"], null));
+      logServerClientSample(plugin2, server, connectedClients);
+      const clientIds = extractServerClientIds(server);
+      plugin2.logger.logInformation(
+        "{Name}: Preparing stats pull for server={Server} with client_ids=[{ClientIds}]",
+        plugin2.name,
+        String(server.toString ? server.toString() : "unknown"),
+        clientIds.join(",")
+      );
+      if (clientIds.length === 0) {
+        plugin2.logger.logInformation("{Name}: No connected client ids available for stats pull on {Server}", plugin2.name, String(server.toString ? server.toString() : "unknown"));
+        done(null, []);
         return;
       }
-      connection.Open();
-      const command = connection.CreateCommand();
-      command.CommandText = buildIngestionQuery(cursorFromUtc);
-      reader = command.ExecuteReader();
-      const dbNull = System.DBNull.Value;
+      context = plugin2.dbContextFactory.createContext(false);
+      if (!context) {
+        done(new Error("IDatabaseContextFactory returned null context."), []);
+        return;
+      }
+      const basicByClientId = buildBasicDataByClientId(context, clientIds);
+      const basicRows = Object.values(basicByClientId);
+      const statRows = statRowsForServer(context, clientIds, server);
+      logContextDataSample(plugin2, basicRows, statRows);
+      plugin2.logger.logInformation(
+        "{Name}: stats pull returned {StatsCount} stat rows and {BasicCount} basic rows for {ClientCount} client ids",
+        plugin2.name,
+        statRows.length,
+        basicRows.length,
+        clientIds.length
+      );
       const rows = [];
-      while (reader.Read()) {
-        const networkId = normalizeNetworkId(dbValueToString(reader["NetworkId"], dbNull));
-        if (!networkId) continue;
-        const gameName = dbValueToString(reader["GameName"], dbNull);
-        const kills = dbValueToInt(reader["Kills"], dbNull);
-        const deaths = dbValueToInt(reader["Deaths"], dbNull);
-        const timePlayed = dbValueToInt(reader["TimePlayed"], dbNull);
-        const sourceUpdatedAt = dbValueToString(reader["SourceUpdatedAt"], dbNull);
-        const liveName = (plugin2.runtime.liveNameByNetworkId || {})[networkId] || "";
-        const aliasName = dbValueToString(reader["AliasName"], dbNull);
-        rows.push({
-          client_id: dbValueToInt(reader["ClientId"], dbNull),
-          network_id: networkId,
-          game_name: gameName,
-          display_name: cleanName(liveName || aliasName || "client_" + networkId),
-          searchable_name: dbValueToString(reader["SearchableName"], dbNull),
-          total_kills: kills,
-          total_deaths: deaths,
-          total_time_played_seconds: timePlayed,
-          average_spm: dbValueToFloat(reader["SPM"], dbNull),
-          average_skill: dbValueToFloat(reader["Skill"], dbNull),
-          average_zscore: dbValueToFloat(reader["ZScore"], dbNull),
-          average_elo_rating: dbValueToFloat(reader["EloRating"], dbNull),
-          average_rolling_weighted_kdr: dbValueToFloat(reader["RollingWeightedKDR"], dbNull),
-          total_connections: dbValueToInt(reader["Connections"], dbNull),
-          total_connection_time_seconds: dbValueToInt(reader["TotalConnectionTime"], dbNull),
-          last_connection_utc: dbValueToString(reader["LastConnection"], dbNull),
-          source_updated_at_utc: sourceUpdatedAt,
-          stat_hash: computeStatHash(networkId, gameName, sourceUpdatedAt, kills, deaths, timePlayed)
-        });
+      for (let i = 0; i < statRows.length; i++) {
+        const stat = statRows[i];
+        const clientId = parseIntSafe(valueFromAny(stat, ["ClientId", "clientId"], 0));
+        const basic = basicByClientId[clientId] || null;
+        const row = buildRowFromStat(stat, basic, plugin2, server);
+        if (!row) continue;
+        plugin2.logger.logInformation(
+          "{Name}: Row candidate client_id={ClientId} network_id={NetworkId} display={Display} searchable={Searchable} kills={Kills} deaths={Deaths} updated_at={UpdatedAt} basic_name={BasicName} stat_game={StatGame}",
+          plugin2.name,
+          row.client_id,
+          row.network_id,
+          row.display_name || "(blank)",
+          row.searchable_name || "(blank)",
+          row.total_kills,
+          row.total_deaths,
+          row.source_updated_at_utc || "(blank)",
+          String(valueFromAnyPath(basic, ["Name", "name", "AliasName", "aliasName", "Alias.Name", "alias.name", "CurrentAlias.Name", "currentAlias.name"], "") || "(blank)"),
+          String(valueFromAny(stat, ["GameName", "gameName"], "") || "(blank)")
+        );
+        if (cursorFromUtc && row.source_updated_at_utc && String(row.source_updated_at_utc) <= String(cursorFromUtc)) {
+          continue;
+        }
+        rows.push(row);
       }
+      rows.sort((a, b) => {
+        const left = String(a.source_updated_at_utc || "");
+        const right = String(b.source_updated_at_utc || "");
+        if (left < right) return -1;
+        if (left > right) return 1;
+        return parseIntSafe(a.client_id) - parseIntSafe(b.client_id);
+      });
       done(null, rows);
     } catch (error) {
       done(new Error(error && error.message ? error.message : "unknown database context read error"), []);
     } finally {
-      try {
-        if (reader) reader.Close();
-      } catch (_) {
-      }
-      try {
-        if (connection) connection.Close();
-      } catch (_) {
-      }
       try {
         if (context && typeof context.Dispose === "function") context.Dispose();
       } catch (_) {
@@ -358,7 +556,7 @@ var _b = (() => {
       }
       const pluginScript = importNamespace("IW4MAdmin.Application.Plugin.Script");
       const request = new pluginScript.ScriptPluginWebRequest(
-        config.apiUrl,
+        DEFAULT_API_URL,
         bodyJson,
         "POST",
         "application/json",
@@ -375,7 +573,7 @@ var _b = (() => {
       logDebug(
         "{Name}: POST dispatched to {Url} ({Bytes} bytes, attempt {Attempt})",
         pluginName,
-        config.apiUrl,
+        DEFAULT_API_URL,
         bodyJson.length,
         attempt
       );
@@ -424,6 +622,7 @@ var _b = (() => {
         Number(payload.batch_index) + 1,
         payload.batch_count
       );
+      logDebug("{Name}: API success response snippet: {Response}", pluginName, snippet(text));
       done(true);
     } catch (e) {
       debugState.lastStatus = "non_json";
@@ -490,19 +689,20 @@ var _b = (() => {
       plugin2.debugState.lastStatus = "sync_exception";
       plugin2.debugState.lastError = error && error.message ? error.message : "unknown sync exception";
       plugin2.debugState.totalFailures += 1;
-      plugin2.logger.logError("{Name}: Sync failed before dispatch - {Error}", plugin2.name, plugin2.debugState.lastError);
+      plugin2.logger.logError("{Name} v{Version}: Sync failed before dispatch - {Error}", plugin2.name, plugin2.version, plugin2.debugState.lastError);
     }
   }
   function runSync(plugin2, trigger, done) {
     const cursorFrom = plugin2.runtime.lastCursorUtc || null;
-    readRows(plugin2, cursorFrom, (error, rows) => {
+    readRows(plugin2, cursorFrom, trigger, (error, rows) => {
       if (error) {
         plugin2.debugState.lastStatus = "read_error";
         plugin2.debugState.lastError = error && error.message ? error.message : "unknown read error";
         plugin2.debugState.totalFailures += 1;
         plugin2.logger.logError(
-          "{Name}: Failed to read leaderboard data from {Source} - {Error}",
+          "{Name} v{Version}: Failed to read leaderboard data from {Source} - {Error}",
           plugin2.name,
+          plugin2.version,
           "db_context",
           plugin2.debugState.lastError
         );
@@ -516,7 +716,7 @@ var _b = (() => {
       if (rowCount === 0) {
         plugin2.debugState.lastStatus = "no_changes";
         plugin2.debugState.lastError = "";
-        plugin2.logger.logInformation("{Name}: No leaderboard changes since cursor {Cursor}", plugin2.name, cursorFrom || "(none)");
+        plugin2.logger.logInformation("{Name} v{Version}: No leaderboard changes since cursor {Cursor}", plugin2.name, plugin2.version, cursorFrom || "(none)");
         done();
         return;
       }
@@ -525,7 +725,20 @@ var _b = (() => {
       const batchId = generateUUID();
       plugin2.runtime.recentBatchId = batchId;
       const chunks = chunkRows(rows, plugin2.config.maxRowsPerRequest);
-      plugin2.logger.logInformation("{Name}: Syncing {Rows} leaderboard rows in {Batches} batch(es)", plugin2.name, rowCount, chunks.length);
+      if (rows.length > 0) {
+        const first = rows[0];
+        plugin2.logger.logInformation(
+          "{Name}: First payload row preview client_id={ClientId} network_id={NetworkId} display={Display} searchable={Searchable} game={Game} updated_at={UpdatedAt}",
+          plugin2.name,
+          first.client_id,
+          first.network_id,
+          first.display_name || "(blank)",
+          first.searchable_name || "(blank)",
+          first.game_name || "(blank)",
+          first.source_updated_at_utc || "(blank)"
+        );
+      }
+      plugin2.logger.logInformation("{Name} v{Version}: Syncing {Rows} leaderboard rows in {Batches} batch(es)", plugin2.name, plugin2.version, rowCount, chunks.length);
       sendBatchSequence(plugin2, chunks, 0, {
         batchId,
         trigger,
@@ -538,15 +751,15 @@ var _b = (() => {
         }
         plugin2.debugState.lastStatus = "accepted";
         plugin2.debugState.lastError = "";
-        plugin2.logger.logInformation("{Name}: Leaderboard sync completed. Cursor now {Cursor}", plugin2.name, plugin2.runtime.lastCursorUtc || "(none)");
+        plugin2.logger.logInformation("{Name} v{Version}: Leaderboard sync completed. Cursor now {Cursor}", plugin2.name, plugin2.version, plugin2.runtime.lastCursorUtc || "(none)");
         done();
       }, () => {
         done();
       });
     });
   }
-  function readRows(plugin2, cursorFrom, done) {
-    readIngestionRowsFromDatabaseContext(plugin2, cursorFrom, (dbError, rows) => {
+  function readRows(plugin2, cursorFrom, trigger, done) {
+    readIngestionRowsFromDatabaseContext(plugin2, cursorFrom, trigger, (dbError, rows) => {
       if (!dbError) {
         done(null, rows);
         return;
@@ -989,9 +1202,44 @@ var _b = (() => {
   }
 
   // src/index.js
+  var PLUGIN_VERSION = true ? "2.0.12" : "0.0.0-dev";
+  function listKeys(value, maxCount) {
+    if (!value) return "(none)";
+    const keys = [];
+    try {
+      const own = Object.keys(value);
+      for (let i = 0; i < own.length; i++) keys.push(String(own[i]));
+    } catch (_) {
+    }
+    try {
+      for (const k in value) keys.push(String(k));
+    } catch (_) {
+    }
+    const uniq = Array.from(new Set(keys)).sort();
+    if (uniq.length === 0) return "(none)";
+    const limit = Math.max(10, parseInt(maxCount, 10) || 80);
+    const suffix = uniq.length > limit ? ",...(truncated)" : "";
+    return uniq.slice(0, limit).join(",") + suffix;
+  }
+  function buildNetworkIdAliases2(rawNetworkId) {
+    const raw = String(rawNetworkId == null ? "" : rawNetworkId).trim();
+    if (!raw) return [];
+    const aliases = [raw];
+    const decValue = parseInt(raw, 10);
+    if (Number.isFinite(decValue)) {
+      aliases.push(String(decValue));
+      aliases.push(decValue.toString(16).toUpperCase());
+    }
+    const hexValue = parseInt(raw, 16);
+    if (Number.isFinite(hexValue)) {
+      aliases.push(String(hexValue));
+      aliases.push(hexValue.toString(16).toUpperCase());
+    }
+    return Array.from(new Set(aliases));
+  }
   var plugin = {
     author: "b_five",
-    version: "2.0",
+    version: PLUGIN_VERSION,
     name: "Match Stats API",
     logger: null,
     manager: null,
@@ -1021,6 +1269,7 @@ var _b = (() => {
       lastCursorUtc: null,
       recentBatchId: null,
       liveNameByNetworkId: {},
+      liveNameByClientId: {},
       activeNetworkIdsByServer: {},
       playerCountByServer: {},
       discordAlertStateByServer: {},
@@ -1052,7 +1301,7 @@ var _b = (() => {
           plugin.logger.logInformation(
             "{Name} config reloaded. API={Url}",
             plugin.name,
-            plugin.config.apiUrl
+            DEFAULT_API_URL
           );
           plugin.configureIntervalSync();
         }
@@ -1079,7 +1328,7 @@ var _b = (() => {
         this.name,
         this.version,
         this.author,
-        this.config.apiUrl,
+        DEFAULT_API_URL,
         this.runtime.lastCursorUtc || "(none)"
       );
       if (!this.config.apiKey) {
@@ -1090,12 +1339,34 @@ var _b = (() => {
     onClientEnterMatch: function(enterEvent, _token) {
       const client = extractClientFromEvent(enterEvent);
       if (!client) return;
+      const clientId = String(client.clientId == null ? "" : client.clientId).trim();
       const networkId = normalizeNetworkId(client.networkId);
-      if (!networkId) return;
       const liveName = cleanName(client.cleanedName || client.name || "");
-      if (!liveName) return;
-      this.runtime.liveNameByNetworkId[networkId] = liveName;
-      this.logDebug("{Name}: Live name cached net={Net} name={Player}", this.name, networkId, liveName);
+      if (liveName) {
+        if (networkId) {
+          const aliases = buildNetworkIdAliases2(networkId);
+          for (let i = 0; i < aliases.length; i++) {
+            this.runtime.liveNameByNetworkId[aliases[i]] = liveName;
+          }
+        }
+        if (clientId) {
+          this.runtime.liveNameByClientId[clientId] = liveName;
+        }
+        this.logger.logInformation(
+          "{Name}: Cached live player identity client_id={ClientId} network_id={NetworkId} name={Player}",
+          this.name,
+          clientId || "(none)",
+          networkId || "(none)",
+          liveName
+        );
+      } else {
+        this.logger.logInformation(
+          "{Name}: ClientEnterMatch observed but no live name available client_id={ClientId} network_id={NetworkId}",
+          this.name,
+          clientId || "(none)",
+          networkId || "(none)"
+        );
+      }
       trackServerPopulation(this, enterEvent);
       pollDiscordCommands(this, enterEvent && enterEvent.server ? enterEvent.server : null);
       this.maybeRunIntervalSync(enterEvent && enterEvent.server ? enterEvent.server : null);
@@ -1120,10 +1391,10 @@ var _b = (() => {
         game: server && server.gameName ? server.gameName.toString() : "",
         game_type: server && server.gameType ? server.gameType.toString() : ""
       };
-      this.logger.logInformation("{Name}: MatchEnded trigger received on {Server}; starting leaderboard sync", this.name, serverKey);
+      this.logger.logInformation("{Name} v{Version}: MatchEnded trigger received on {Server}; starting leaderboard sync", this.name, this.version, serverKey);
       trackServerPopulation(this, matchEndEvent);
       pollDiscordCommands(this, server);
-      enqueueSync(this, trigger);
+      this.queueMatchEndSync(trigger);
     },
     onClientEnteredCommand: function(commandEvent, _token) {
       if (!commandEvent || !commandEvent.origin) return;
@@ -1137,28 +1408,76 @@ var _b = (() => {
       if (command === "msd" || command === "msdebug") {
         this.toggleDebugFromCommand(commandEvent, parsed.args);
       }
+      if (command === "msp" || command === "msprobe") {
+        this.probeRuntime(commandEvent);
+        return;
+      }
       this.maybeRunIntervalSync(commandEvent && commandEvent.server ? commandEvent.server : null);
+    },
+    probeRuntime: function(commandEvent) {
+      const server = commandEvent && commandEvent.server ? commandEvent.server : null;
+      const origin = commandEvent && commandEvent.origin ? commandEvent.origin : null;
+      this.logger.logInformation("{Name}: PROBE command_event_keys={Keys}", this.name, listKeys(commandEvent, 120));
+      this.logger.logInformation("{Name}: PROBE origin_keys={Keys}", this.name, listKeys(origin, 120));
+      this.logger.logInformation("{Name}: PROBE server_keys={Keys}", this.name, listKeys(server, 140));
+      try {
+        const connected = server ? server.connectedClients || server.ConnectedClients || server.clients || server.Clients : null;
+        this.logger.logInformation("{Name}: PROBE connected_clients_keys={Keys}", this.name, listKeys(connected, 120));
+        const first = connected && connected[0] ? connected[0] : null;
+        this.logger.logInformation("{Name}: PROBE first_connected_client_keys={Keys}", this.name, listKeys(first, 140));
+      } catch (_) {
+        this.logger.logWarning("{Name}: PROBE failed while inspecting server connected clients", this.name);
+      }
+      try {
+        const ctx = this.dbContextFactory ? this.dbContextFactory.createContext(false) : null;
+        this.logger.logInformation("{Name}: PROBE db_context_keys={Keys}", this.name, listKeys(ctx, 160));
+        this.logger.logInformation("{Name}: PROBE db_context.clients_keys={Keys}", this.name, listKeys(ctx ? ctx.Clients || ctx.clients : null, 160));
+        this.logger.logInformation("{Name}: PROBE db_context.client_statistics_keys={Keys}", this.name, listKeys(ctx ? ctx.ClientStatistics || ctx.clientStatistics : null, 160));
+        try {
+          if (ctx && typeof ctx.Dispose === "function") ctx.Dispose();
+        } catch (_) {
+        }
+      } catch (error) {
+        this.logger.logWarning(
+          "{Name}: PROBE context inspection failed: {Error}",
+          this.name,
+          error && error.message ? error.message : "unknown error"
+        );
+      }
+      commandEvent.origin.tell("Match Stats API probe logged to IW4M logs.");
     },
     tellStatus: function(commandEvent) {
       commandEvent.origin.tell(
-        "Match Stats API: ENABLED | Mode: DB context ingestion | Source=db_context | Last=" + this.debugState.lastStatus + " | Rows(read/sent)=" + this.debugState.lastRowsRead + "/" + this.debugState.lastRowsSent + " | Cursor=" + (this.runtime.lastCursorUtc || "(none)")
+        "Match Stats API v" + this.version + ": ENABLED | Mode: DB context ingestion | Source=db_context | Last=" + this.debugState.lastStatus + " | Rows(read/sent)=" + this.debugState.lastRowsRead + "/" + this.debugState.lastRowsSent + " | Cursor=" + (this.runtime.lastCursorUtc || "(none)")
       );
     },
     shouldPersistSanitizedConfig: function(stored, sanitized) {
       const source = stored || {};
       const sourceApiKey = source.apiKey == null ? "" : String(source.apiKey).trim();
-      const sourceApiUrl = source.apiUrl == null ? "" : String(source.apiUrl).trim();
       const sourceRetries = parseInt(source.maxRetries, 10);
       const sourceBatchSize = parseInt(source.maxRowsPerRequest, 10);
       const sourceCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+      const sourcePostMatchDelay = parseInt(source.postMatchSyncDelaySeconds, 10);
       const sourceSnapshotInterval = parseInt(source.snapshotIntervalSeconds, 10);
       if (sourceApiKey !== sanitized.apiKey) return true;
-      if (sourceApiUrl !== sanitized.apiUrl) return true;
       if (!(Number.isFinite(sourceRetries) && sourceRetries >= 0 && sourceRetries === sanitized.maxRetries)) return true;
       if (!(Number.isFinite(sourceBatchSize) && sourceBatchSize > 0 && sourceBatchSize === sanitized.maxRowsPerRequest)) return true;
       if (!(Number.isFinite(sourceCooldown) && sourceCooldown > 0 && sourceCooldown === sanitized.minSecondsBetweenSyncs)) return true;
+      if (!(Number.isFinite(sourcePostMatchDelay) && sourcePostMatchDelay >= 0 && sourcePostMatchDelay === sanitized.postMatchSyncDelaySeconds)) return true;
       if (!(Number.isFinite(sourceSnapshotInterval) && sourceSnapshotInterval >= 5 && sourceSnapshotInterval === sanitized.snapshotIntervalSeconds)) return true;
       return false;
+    },
+    queueMatchEndSync: function(trigger) {
+      const delaySeconds = Math.max(0, parseInt(this.config.postMatchSyncDelaySeconds, 10) || 0);
+      if (!this.pluginHelper || typeof this.pluginHelper.requestNotifyAfterDelay !== "function" || delaySeconds === 0) {
+        enqueueSync(this, trigger);
+        return;
+      }
+      const delayMs = delaySeconds * 1e3;
+      this.logger.logInformation("{Name}: Scheduling match-end sync after {Seconds}s", this.name, delaySeconds);
+      this.pluginHelper.requestNotifyAfterDelay(delayMs, () => {
+        enqueueSync(this, trigger);
+      });
     },
     configureIntervalSync: function() {
       const seconds = Math.max(5, parseInt(this.config.snapshotIntervalSeconds, 10) || 300);
@@ -1267,6 +1586,17 @@ var _b = (() => {
       execute: (gameEvent) => {
         const arg = (gameEvent.data || "").trim().toLowerCase();
         plugin.toggleDebugFromCommand(gameEvent, arg);
+      }
+    },
+    {
+      name: "msprobe",
+      description: "logs available runtime keys for debugging",
+      alias: "msp",
+      permission: "User",
+      targetRequired: false,
+      arguments: [],
+      execute: (gameEvent) => {
+        plugin.probeRuntime(gameEvent);
       }
     }
   ];

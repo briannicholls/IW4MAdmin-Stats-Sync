@@ -1,4 +1,5 @@
 import { snippet } from './utils.js';
+import { DEFAULT_API_URL } from './config.js';
 
 export function responseToText(response) {
     if (response == null) return '';
@@ -72,7 +73,7 @@ export function postPayload(config, pluginHelper, logger, debugState, pluginName
 
         const pluginScript = importNamespace('IW4MAdmin.Application.Plugin.Script');
         const request = new pluginScript.ScriptPluginWebRequest(
-            config.apiUrl,
+            DEFAULT_API_URL,
             bodyJson,
             'POST',
             'application/json',
@@ -90,7 +91,7 @@ export function postPayload(config, pluginHelper, logger, debugState, pluginName
         debugState.lastStatus = 'dispatched';
         debugState.totalPosts += 1;
         logDebug('{Name}: POST dispatched to {Url} ({Bytes} bytes, attempt {Attempt})',
-            pluginName, config.apiUrl, bodyJson.length, attempt);
+            pluginName, DEFAULT_API_URL, bodyJson.length, attempt);
     } catch (ex) {
         debugState.lastStatus = 'exception';
         debugState.lastError = ex && ex.message ? ex.message : 'unknown request exception';
@@ -136,6 +137,7 @@ function onApiResponse(response, config, logger, debugState, pluginName, pluginH
             pluginName,
             Number(payload.batch_index) + 1,
             payload.batch_count);
+        logDebug('{Name}: API success response snippet: {Response}', pluginName, snippet(text));
         done(true);
     } catch (e) {
         debugState.lastStatus = 'non_json';

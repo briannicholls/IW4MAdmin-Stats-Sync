@@ -33,19 +33,20 @@ export function enqueueSync(plugin, trigger) {
         plugin.debugState.lastStatus = 'sync_exception';
         plugin.debugState.lastError = error && error.message ? error.message : 'unknown sync exception';
         plugin.debugState.totalFailures += 1;
-        plugin.logger.logError('{Name}: Sync failed before dispatch - {Error}', plugin.name, plugin.debugState.lastError);
+        plugin.logger.logError('{Name} v{Version}: Sync failed before dispatch - {Error}', plugin.name, plugin.version, plugin.debugState.lastError);
     }
 }
 
 function runSync(plugin, trigger, done) {
     const cursorFrom = plugin.runtime.lastCursorUtc || null;
-    readRows(plugin, cursorFrom, (error, rows) => {
+    readRows(plugin, cursorFrom, trigger, (error, rows) => {
         if (error) {
             plugin.debugState.lastStatus = 'read_error';
             plugin.debugState.lastError = error && error.message ? error.message : 'unknown read error';
             plugin.debugState.totalFailures += 1;
-            plugin.logger.logError('{Name}: Failed to read leaderboard data from {Source} - {Error}',
+            plugin.logger.logError('{Name} v{Version}: Failed to read leaderboard data from {Source} - {Error}',
                 plugin.name,
+                plugin.version,
                 'db_context',
                 plugin.debugState.lastError);
             done();
@@ -61,7 +62,7 @@ function runSync(plugin, trigger, done) {
         if (rowCount === 0) {
             plugin.debugState.lastStatus = 'no_changes';
             plugin.debugState.lastError = '';
-            plugin.logger.logInformation('{Name}: No leaderboard changes since cursor {Cursor}', plugin.name, cursorFrom || '(none)');
+            plugin.logger.logInformation('{Name} v{Version}: No leaderboard changes since cursor {Cursor}', plugin.name, plugin.version, cursorFrom || '(none)');
             done();
             return;
         }
@@ -72,7 +73,19 @@ function runSync(plugin, trigger, done) {
         plugin.runtime.recentBatchId = batchId;
         const chunks = chunkRows(rows, plugin.config.maxRowsPerRequest);
 
-        plugin.logger.logInformation('{Name}: Syncing {Rows} leaderboard rows in {Batches} batch(es)', plugin.name, rowCount, chunks.length);
+        if (rows.length > 0) {
+            const first = rows[0];
+            plugin.logger.logInformation('{Name}: First payload row preview client_id={ClientId} network_id={NetworkId} display={Display} searchable={Searchable} game={Game} updated_at={UpdatedAt}',
+                plugin.name,
+                first.client_id,
+                first.network_id,
+                first.display_name || '(blank)',
+                first.searchable_name || '(blank)',
+                first.game_name || '(blank)',
+                first.source_updated_at_utc || '(blank)');
+        }
+
+        plugin.logger.logInformation('{Name} v{Version}: Syncing {Rows} leaderboard rows in {Batches} batch(es)', plugin.name, plugin.version, rowCount, chunks.length);
 
         sendBatchSequence(plugin, chunks, 0, {
             batchId: batchId,
@@ -86,7 +99,7 @@ function runSync(plugin, trigger, done) {
             }
             plugin.debugState.lastStatus = 'accepted';
             plugin.debugState.lastError = '';
-            plugin.logger.logInformation('{Name}: Leaderboard sync completed. Cursor now {Cursor}', plugin.name, plugin.runtime.lastCursorUtc || '(none)');
+            plugin.logger.logInformation('{Name} v{Version}: Leaderboard sync completed. Cursor now {Cursor}', plugin.name, plugin.version, plugin.runtime.lastCursorUtc || '(none)');
             done();
         }, () => {
             done();
@@ -94,8 +107,8 @@ function runSync(plugin, trigger, done) {
     });
 }
 
-function readRows(plugin, cursorFrom, done) {
-    readIngestionRowsFromDatabaseContext(plugin, cursorFrom, (dbError, rows) => {
+function readRows(plugin, cursorFrom, trigger, done) {
+    readIngestionRowsFromDatabaseContext(plugin, cursorFrom, trigger, (dbError, rows) => {
         if (!dbError) {
             done(null, rows);
             return;

@@ -1,11 +1,51 @@
-import { defaultConfig, sanitizeConfig } from './config.js';
+import { defaultConfig, sanitizeConfig, DEFAULT_API_URL } from './config.js';
 import { cleanName, normalizeNetworkId, getServerKey, extractClientFromEvent, parseCommand } from './utils.js';
 import { enqueueSync } from './sync.js';
 import { trackServerPopulation, pollDiscordCommands } from './discord.js';
 
+const PLUGIN_VERSION = typeof __PLUGIN_VERSION__ === 'string' ? __PLUGIN_VERSION__ : '0.0.0-dev';
+
+function listKeys(value, maxCount) {
+    if (!value) return '(none)';
+    const keys = [];
+    try {
+        const own = Object.keys(value);
+        for (let i = 0; i < own.length; i++) keys.push(String(own[i]));
+    } catch (_) { }
+    try {
+        for (const k in value) keys.push(String(k));
+    } catch (_) { }
+    const uniq = Array.from(new Set(keys)).sort();
+    if (uniq.length === 0) return '(none)';
+    const limit = Math.max(10, parseInt(maxCount, 10) || 80);
+    const suffix = uniq.length > limit ? ',...(truncated)' : '';
+    return uniq.slice(0, limit).join(',') + suffix;
+}
+
+function buildNetworkIdAliases(rawNetworkId) {
+    const raw = String(rawNetworkId == null ? '' : rawNetworkId).trim();
+    if (!raw) return [];
+
+    const aliases = [raw];
+
+    const decValue = parseInt(raw, 10);
+    if (Number.isFinite(decValue)) {
+        aliases.push(String(decValue));
+        aliases.push(decValue.toString(16).toUpperCase());
+    }
+
+    const hexValue = parseInt(raw, 16);
+    if (Number.isFinite(hexValue)) {
+        aliases.push(String(hexValue));
+        aliases.push(hexValue.toString(16).toUpperCase());
+    }
+
+    return Array.from(new Set(aliases));
+}
+
 const plugin = {
     author: 'b_five',
-    version: '2.0',
+    version: PLUGIN_VERSION,
     name: 'Match Stats API',
     logger: null,
     manager: null,
@@ -38,6 +78,7 @@ const plugin = {
         lastCursorUtc: null,
         recentBatchId: null,
         liveNameByNetworkId: {},
+        liveNameByClientId: {},
         activeNetworkIdsByServer: {},
         playerCountByServer: {},
         discordAlertStateByServer: {},
@@ -69,7 +110,7 @@ const plugin = {
             if (newCfg) {
                 plugin.config = sanitizeConfig(newCfg);
                 plugin.logger.logInformation('{Name} config reloaded. API={Url}',
-                    plugin.name, plugin.config.apiUrl);
+                    plugin.name, DEFAULT_API_URL);
                 plugin.configureIntervalSync();
             }
         });
@@ -99,7 +140,7 @@ const plugin = {
             this.name,
             this.version,
             this.author,
-            this.config.apiUrl,
+            DEFAULT_API_URL,
             this.runtime.lastCursorUtc || '(none)'
         );
 
@@ -114,14 +155,31 @@ const plugin = {
         const client = extractClientFromEvent(enterEvent);
         if (!client) return;
 
+        const clientId = String(client.clientId == null ? '' : client.clientId).trim();
         const networkId = normalizeNetworkId(client.networkId);
-        if (!networkId) return;
 
         const liveName = cleanName(client.cleanedName || client.name || '');
-        if (!liveName) return;
-
-        this.runtime.liveNameByNetworkId[networkId] = liveName;
-        this.logDebug('{Name}: Live name cached net={Net} name={Player}', this.name, networkId, liveName);
+        if (liveName) {
+            if (networkId) {
+                const aliases = buildNetworkIdAliases(networkId);
+                for (let i = 0; i < aliases.length; i++) {
+                    this.runtime.liveNameByNetworkId[aliases[i]] = liveName;
+                }
+            }
+            if (clientId) {
+                this.runtime.liveNameByClientId[clientId] = liveName;
+            }
+            this.logger.logInformation('{Name}: Cached live player identity client_id={ClientId} network_id={NetworkId} name={Player}',
+                this.name,
+                clientId || '(none)',
+                networkId || '(none)',
+                liveName);
+        } else {
+            this.logger.logInformation('{Name}: ClientEnterMatch observed but no live name available client_id={ClientId} network_id={NetworkId}',
+                this.name,
+                clientId || '(none)',
+                networkId || '(none)');
+        }
 
         trackServerPopulation(this, enterEvent);
         pollDiscordCommands(this, enterEvent && enterEvent.server ? enterEvent.server : null);
@@ -151,10 +209,10 @@ const plugin = {
             game_type: server && server.gameType ? server.gameType.toString() : ''
         };
 
-        this.logger.logInformation('{Name}: MatchEnded trigger received on {Server}; starting leaderboard sync', this.name, serverKey);
+        this.logger.logInformation('{Name} v{Version}: MatchEnded trigger received on {Server}; starting leaderboard sync', this.name, this.version, serverKey);
         trackServerPopulation(this, matchEndEvent);
         pollDiscordCommands(this, server);
-        enqueueSync(this, trigger);
+        this.queueMatchEndSync(trigger);
     },
 
     onClientEnteredCommand: function (commandEvent, _token) {
@@ -173,12 +231,49 @@ const plugin = {
             this.toggleDebugFromCommand(commandEvent, parsed.args);
         }
 
+        if (command === 'msp' || command === 'msprobe') {
+            this.probeRuntime(commandEvent);
+            return;
+        }
+
         this.maybeRunIntervalSync(commandEvent && commandEvent.server ? commandEvent.server : null);
+    },
+
+    probeRuntime: function (commandEvent) {
+        const server = commandEvent && commandEvent.server ? commandEvent.server : null;
+        const origin = commandEvent && commandEvent.origin ? commandEvent.origin : null;
+
+        this.logger.logInformation('{Name}: PROBE command_event_keys={Keys}', this.name, listKeys(commandEvent, 120));
+        this.logger.logInformation('{Name}: PROBE origin_keys={Keys}', this.name, listKeys(origin, 120));
+        this.logger.logInformation('{Name}: PROBE server_keys={Keys}', this.name, listKeys(server, 140));
+
+        try {
+            const connected = server ? (server.connectedClients || server.ConnectedClients || server.clients || server.Clients) : null;
+            this.logger.logInformation('{Name}: PROBE connected_clients_keys={Keys}', this.name, listKeys(connected, 120));
+            const first = connected && connected[0] ? connected[0] : null;
+            this.logger.logInformation('{Name}: PROBE first_connected_client_keys={Keys}', this.name, listKeys(first, 140));
+        } catch (_) {
+            this.logger.logWarning('{Name}: PROBE failed while inspecting server connected clients', this.name);
+        }
+
+        try {
+            const ctx = this.dbContextFactory ? this.dbContextFactory.createContext(false) : null;
+            this.logger.logInformation('{Name}: PROBE db_context_keys={Keys}', this.name, listKeys(ctx, 160));
+            this.logger.logInformation('{Name}: PROBE db_context.clients_keys={Keys}', this.name, listKeys(ctx ? (ctx.Clients || ctx.clients) : null, 160));
+            this.logger.logInformation('{Name}: PROBE db_context.client_statistics_keys={Keys}', this.name, listKeys(ctx ? (ctx.ClientStatistics || ctx.clientStatistics) : null, 160));
+            try { if (ctx && typeof ctx.Dispose === 'function') ctx.Dispose(); } catch (_) { }
+        } catch (error) {
+            this.logger.logWarning('{Name}: PROBE context inspection failed: {Error}',
+                this.name,
+                error && error.message ? error.message : 'unknown error');
+        }
+
+        commandEvent.origin.tell('Match Stats API probe logged to IW4M logs.');
     },
 
     tellStatus: function (commandEvent) {
         commandEvent.origin.tell(
-            'Match Stats API: ENABLED' +
+            'Match Stats API v' + this.version + ': ENABLED' +
             ' | Mode: DB context ingestion' +
             ' | Source=db_context' +
             ' | Last=' + this.debugState.lastStatus +
@@ -190,19 +285,33 @@ const plugin = {
     shouldPersistSanitizedConfig: function (stored, sanitized) {
         const source = stored || {};
         const sourceApiKey = source.apiKey == null ? '' : String(source.apiKey).trim();
-        const sourceApiUrl = source.apiUrl == null ? '' : String(source.apiUrl).trim();
         const sourceRetries = parseInt(source.maxRetries, 10);
         const sourceBatchSize = parseInt(source.maxRowsPerRequest, 10);
         const sourceCooldown = parseInt(source.minSecondsBetweenSyncs, 10);
+        const sourcePostMatchDelay = parseInt(source.postMatchSyncDelaySeconds, 10);
         const sourceSnapshotInterval = parseInt(source.snapshotIntervalSeconds, 10);
 
         if (sourceApiKey !== sanitized.apiKey) return true;
-        if (sourceApiUrl !== sanitized.apiUrl) return true;
         if (!(Number.isFinite(sourceRetries) && sourceRetries >= 0 && sourceRetries === sanitized.maxRetries)) return true;
         if (!(Number.isFinite(sourceBatchSize) && sourceBatchSize > 0 && sourceBatchSize === sanitized.maxRowsPerRequest)) return true;
         if (!(Number.isFinite(sourceCooldown) && sourceCooldown > 0 && sourceCooldown === sanitized.minSecondsBetweenSyncs)) return true;
+        if (!(Number.isFinite(sourcePostMatchDelay) && sourcePostMatchDelay >= 0 && sourcePostMatchDelay === sanitized.postMatchSyncDelaySeconds)) return true;
         if (!(Number.isFinite(sourceSnapshotInterval) && sourceSnapshotInterval >= 5 && sourceSnapshotInterval === sanitized.snapshotIntervalSeconds)) return true;
         return false;
+    },
+
+    queueMatchEndSync: function (trigger) {
+        const delaySeconds = Math.max(0, parseInt(this.config.postMatchSyncDelaySeconds, 10) || 0);
+        if (!this.pluginHelper || typeof this.pluginHelper.requestNotifyAfterDelay !== 'function' || delaySeconds === 0) {
+            enqueueSync(this, trigger);
+            return;
+        }
+
+        const delayMs = delaySeconds * 1000;
+        this.logger.logInformation('{Name}: Scheduling match-end sync after {Seconds}s', this.name, delaySeconds);
+        this.pluginHelper.requestNotifyAfterDelay(delayMs, () => {
+            enqueueSync(this, trigger);
+        });
     },
 
     configureIntervalSync: function () {
@@ -325,6 +434,17 @@ const commands = [
         execute: (gameEvent) => {
             const arg = (gameEvent.data || '').trim().toLowerCase();
             plugin.toggleDebugFromCommand(gameEvent, arg);
+        }
+    },
+    {
+        name: 'msprobe',
+        description: 'logs available runtime keys for debugging',
+        alias: 'msp',
+        permission: 'User',
+        targetRequired: false,
+        arguments: [],
+        execute: (gameEvent) => {
+            plugin.probeRuntime(gameEvent);
         }
     }
 ];

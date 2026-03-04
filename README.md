@@ -15,7 +15,7 @@ This plugin uses IW4M's internal `IDatabaseContextFactory` service (not Webfront
 
 ## Installation
 
-1. Build and copy `dist/MatchStatsAPI.js` into your IW4MAdmin `Plugins` folder.
+1. Run `npm run build` (this bumps plugin patch version and embeds it in logs), then copy `dist/MatchStatsAPI.js` into your IW4MAdmin `Plugins` folder.
 2. Restart IW4MAdmin.
 3. Open plugin settings in:
 
@@ -30,7 +30,6 @@ Plugin settings are stored under your script plugin entry key in the `config` ob
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `apiKey` | string | *(empty)* | Bearer token sent in `Authorization` header. |
-| `apiUrl` | string | `http://localhost:6969/iw4m/leaderboard_snapshots` | Ingest endpoint. |
 | `maxRetries` | number | `1` | Retry attempts per failed POST. Total attempts = `1 + maxRetries`. |
 | `maxRowsPerRequest` | number | `500` | Number of DB rows per HTTP batch. |
 | `minSecondsBetweenSyncs` | number | `20` | Per-server cooldown to ignore duplicate `MatchEnded` triggers. |
@@ -49,7 +48,6 @@ Example:
 ```json
 {
   "apiKey": "YOUR_360_API_KEY",
-  "apiUrl": "http://localhost:6969/iw4m/leaderboard_snapshots",
   "maxRetries": 1,
   "maxRowsPerRequest": 500,
   "minSecondsBetweenSyncs": 20,
@@ -64,6 +62,8 @@ Example:
   "discordPollIntervalSeconds": 15
 }
 ```
+
+In this development build, the ingest endpoint is fixed to `http://localhost:6969/iw4m/leaderboard_snapshots`.
 
 ## Triggering
 
@@ -162,4 +162,3 @@ Your endpoint should:
 - **Repeated retries**: inspect IW4M logs for `Match Stats API` entries and API response snippets.
 
 ## Development
-
